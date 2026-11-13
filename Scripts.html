@@ -1,0 +1,4334 @@
+<script>
+(function () {
+  'use strict';
+
+  /* ====================================================================== */
+  /* APP STATE                                                              */
+  /* ====================================================================== */
+
+  var App = {
+    version: document.body.getAttribute('data-app-version') || '',
+    logoUrl: document.body.getAttribute('data-logo-url') || '',
+    userEmail: document.body.getAttribute('data-user-email') || 'user@gea.co.id',
+    initialView: document.body.getAttribute('data-initial-view') || 'dashboard',
+    activeView: 'dashboard',
+    invTab: 'balance',
+    inboundTab: 'receiving',
+    outboundTab: 'orders',
+    masterType: 'items',
+    options: null,
+    optionsPromise: null,
+    dashboard: null,
+    dashboardPromise: null,
+    booted: false,
+    eventsBound: false,
+    pingTimer: null,
+    autoSyncTimer: null,
+    autoSyncBusy: false,
+    loginBusy: false,
+    token: '',
+    user: null,
+    role: '',
+    permissions: [],
+    lastSync: null,
+    loaded: {},
+    masterRows: {},
+    /* Client-side cache per tabel (lazy-loaded saat tab diklik). */
+    cache: {
+      stockLogs: null,
+      inboundReceiving: null,
+      quarantine: null,
+      claims: null,
+      outboundOrders: null,
+      pickingList: null,
+      dispatchManifest: null,
+      soHeader: null,
+      soDetail: null,
+      syncHistory: null,
+      masterItems: null,
+      masterLocations: null,
+      masterSuppliers: null,
+      masterOutlets: null,
+      masterUsers: null
+    },
+    /* Filter state per tab. */
+    filters: {
+      stockMonitor: { search: '', kategori: '', status: '', pageSize: 25, page: 1 },
+      stockCard: { sku: '', kategori: '', startDate: '', endDate: '', tipe: '', pageSize: 25, page: 1 },
+      inbound: { search: '', status: 'ALL', page: 1 },
+      quarantine: { search: '', status: 'ALL', page: 1 },
+      claims: { search: '', status: 'ALL', page: 1 },
+      outbound: { search: '', status: 'ALL', page: 1 },
+      picking: { search: '', status: 'ALL', page: 1 },
+      manifest: { search: '', status: 'ALL', page: 1 },
+      opname: { search: '', status: 'ALL', page: 1 },
+      approval: { search: '', status: 'ALL', page: 1 },
+      master: { search: '', type: 'items', page: 1 }
+    },
+    states: {
+      stockMonitor: { allRows: [], filteredRows: [], page: 1, pageSize: 25 },
+      stockCard: { allRows: [], summary: {}, page: 1, pageSize: 25 },
+      dashboard: { critical: [], outbound: [] }
+    }
+  };
+
+  var AUTH_STORAGE = {
+    remember: 'wms_token_remember',
+    session: 'wms_token_session'
+  };
+
+  var PUBLIC_ACTIONS = {
+    loginUser: true,
+    restoreSession: true,
+    logoutUser: true,
+    getLoginInfo: true,
+    ping: true
+  };
+
+  var VIEW_META = {
+    dashboard: { title: 'Dashboard', subtitle: 'Ringkasan operasional gudang PT GEA', permission: 'dashboard' },
+    inventory: { title: 'Inventory & Kartu Stok', subtitle: 'Monitoring saldo stok dan riwayat mutasi per SKU', permission: 'stock-monitor' },
+    inbound: { title: 'Inbound & Retur', subtitle: 'Penerimaan AppSheet, karantina cacat, dan klaim retur', permission: 'inbound' },
+    outbound: { title: 'Outbound & Pengiriman', subtitle: 'Order PO, picking list, dan manifest pengiriman', permission: 'order-status' },
+    opname: { title: 'Stock Opname (SO)', subtitle: 'Perintah SO, blind count, variance, dan approval BASO', permission: 'opname' },
+    master: { title: 'Master Data & Sistem', subtitle: 'Barang, rak, supplier, outlet, users, dan sync logs', permission: 'master' },
+    sync: { title: 'Sinkronisasi', subtitle: 'Rekonsiliasi INBOUND_RECEIVING dan OUTBOUND_ORDERS', permission: 'sync' },
+    adjustment: { title: 'Adjustment Stok', subtitle: 'Koreksi saldo dan transfer antar bin', permission: 'adjustment' },
+    approval: { title: 'Approval BASO', subtitle: 'Persetujuan hasil stock opname', permission: 'approval' },
+    users: { title: 'Users & Sync Logs', subtitle: 'Kelola akun, role, status, dan riwayat sinkronisasi', permission: 'users' }
+  };
+
+  /* ====================================================================== */
+  /* UTILITY                                                                */
+  /* ====================================================================== */
+
+  function q(selector, root) {
+    return (root || document).querySelector(selector);
+  }
+
+  function qa(selector, root) {
+    return Array.prototype.slice.call((root || document).querySelectorAll(selector));
+  }
+
+  /**
+   * Aman untuk semua elemen opsional. Tidak pernah melempar error jika elemen
+   * belum ada di DOM (mis. modal yang baru dibuat saat dibuka).
+   */
+  function safeBind(idOrSelector, event, handler, options) {
+    try {
+      var target = typeof idOrSelector === 'string' ? q(idOrSelector) : idOrSelector;
+      if (!target || typeof target.addEventListener !== 'function') {
+        return null;
+      }
+      target.addEventListener(event, handler, options);
+      return target;
+    } catch (err) {
+      console.warn('safeBind gagal:', idOrSelector, event, err);
+      return null;
+    }
+  }
+
+  function esc(value) {
+    return String(value === null || value === undefined ? '' : value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function fmtNum(value) {
+    var number = Number(value);
+    if (!isFinite(number)) {
+      return '0';
+    }
+    return number.toLocaleString('id-ID');
+  }
+
+  function qtyCell(value) {
+    var number = Number(value);
+    if (!isFinite(number)) {
+      number = 0;
+    }
+    var cls = number > 0 ? 'qty-positive' : number < 0 ? 'qty-negative' : 'qty-zero';
+    return '<span class="' + cls + '">' + (number > 0 ? '+' : '') + fmtNum(number) + '</span>';
+  }
+
+  function shortDate(value) {
+    var text = String(value === null || value === undefined ? '' : value).trim();
+    if (!text) {
+      return '-';
+    }
+    if (text.length >= 16) {
+      return text.slice(0, 16);
+    }
+    if (text.length >= 10) {
+      return text.slice(0, 10);
+    }
+    return text;
+  }
+
+  function statusBadge(value) {
+    var text = String(value === null || value === undefined ? '' : value).trim();
+    if (!text) {
+      return '<span class="status-badge tone-muted">-</span>';
+    }
+    var key = text.toUpperCase();
+    var tone = 'tone-muted';
+    if (['PASS', 'DONE', 'ACTIVE', 'AVAILABLE', 'APPROVED', 'COMPLETED', 'DELIVERED', 'SHIPPED', 'RESOLVED', 'CLOSED', 'ONLINE', 'FAST', 'NORMAL'].indexOf(key) >= 0) {
+      tone = 'tone-success';
+    } else if (['PENDING', 'COUNTED', 'CONFIRMED', 'WAITING_REPLACEMENT', 'SLOW', 'LOW'].indexOf(key) >= 0) {
+      tone = 'tone-warning';
+    } else if (['PICKING', 'CHECKING', 'PACKED', 'DISPATCHED', 'OPEN', 'IN', 'TRANSFER', 'IN_PROGRESS'].indexOf(key) >= 0) {
+      tone = 'tone-info';
+    } else if (['CANCELLED', 'QUARANTINE', 'SCRAPPED', 'OUT', 'RETURNED_TO_SUPPLIER'].indexOf(key) >= 0) {
+      tone = 'tone-danger';
+    } else if (['ADJUST', 'EMPTY', 'OVERSTOCK'].indexOf(key) >= 0) {
+      tone = key === 'EMPTY' ? 'tone-danger' : key === 'OVERSTOCK' ? 'tone-info' : 'tone-navy';
+    }
+    return '<span class="status-badge ' + tone + '">' + esc(text) + '</span>';
+  }
+
+  function stockSourceMeta_(source) {
+    var key = normalizeKey_(source) || 'APPSHEET';
+    var label;
+    var cls;
+    if (key === 'APPSHEET' || key === 'APP') {
+      label = 'APPSHEET';
+      cls = 'APPSHEET';
+    } else if (key === 'SYNC_APPSHEET') {
+      label = 'SYNC-APPSHEET';
+      cls = 'SYNC_APPSHEET';
+    } else if (key === 'SYNC_IMPORTRANGE') {
+      label = 'IMPORTRANGE';
+      cls = 'SYNC_IMPORTRANGE';
+    } else if (key === 'WEB') {
+      label = 'WEB';
+      cls = 'WEB';
+    } else {
+      label = key;
+      cls = key;
+    }
+    return { key: key, label: label, cls: cls };
+  }
+
+  function stockSourceBadgeHtml(source) {
+    var meta = stockSourceMeta_(source);
+    return '<span class="badge-source ' + meta.cls + '">' + esc(meta.label) + '</span>';
+  }
+
+  function stockStatusTone_(status) {
+    var key = normalizeKey_(status) || 'NORMAL';
+    if (key === 'EMPTY') { return 'tone-danger'; }
+    if (key === 'LOW') { return 'tone-warning'; }
+    if (key === 'OVERSTOCK') { return 'tone-info'; }
+    if (key === 'NORMAL') { return 'tone-success'; }
+    return 'tone-muted';
+  }
+
+  function fmtTglHm(value) {
+    var text = String(value === null || value === undefined ? '' : value).trim();
+    if (!text) {
+      return '-';
+    }
+    var d = new Date(text);
+    if (isNaN(d.getTime())) {
+      return text.length > 16 ? text.slice(0, 16) : text;
+    }
+    var dd = String(d.getDate()).padStart(2, '0');
+    var mm = String(d.getMonth() + 1).padStart(2, '0');
+    var hh = String(d.getHours()).padStart(2, '0');
+    var min = String(d.getMinutes()).padStart(2, '0');
+    return dd + '/' + mm + ' ' + hh + ':' + min;
+  }
+
+  function normalizeKey_(value) {
+    return String(value === null || value === undefined ? '' : value).trim().toUpperCase();
+  }
+
+  function debounce(fn, wait) {
+    var timer = null;
+    return function () {
+      var args = arguments;
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        fn.apply(null, args);
+      }, wait);
+    };
+  }
+
+  /* Global error handler: mencegah layar kosong (blank) ketika terjadi
+     error tak tertangkap di frontend. Tampilkan toast/pesan yang jelas. */
+  window.onerror = function (message, source, lineno, colno, error) {
+    console.error('Global error:', message, 'at', source || '', ':', lineno || '');
+    try {
+      // Tampilkan di debug banner
+      var banner = document.getElementById('wms-error-banner');
+      var msg = document.getElementById('wms-error-msg');
+      if (banner && msg) {
+        msg.textContent = message || 'Terjadi kesalahan yang tidak diketahui.';
+        banner.style.display = 'block';
+      }
+      if (typeof Swal !== 'undefined') {
+        Swal.fire({
+          icon: 'error',
+          title: 'Kesalahan Aplikasi',
+          text: message || 'Terjadi kesalahan yang tidak diketahui.',
+          confirmButtonText: 'Tutup'
+        });
+      } else {
+        alert('Kesalahan aplikasi: ' + (message || 'Terjadi kesalahan yang tidak diketahui.'));
+      }
+    } catch (err) {
+      // Jika bahkan Swal gagal, biarkan console.error sebagai fallback.
+    }
+    return false;
+  };
+
+  window.onunhandledrejection = function (event) {
+    console.error('Unhandled promise rejection:', event.reason);
+    try {
+      var banner = document.getElementById('wms-error-banner');
+      var msg = document.getElementById('wms-error-msg');
+      if (banner && msg) {
+        msg.textContent = event.reason && event.reason.message ? event.reason.message : 'Terjadi kesalahan pada permintaan server.';
+        banner.style.display = 'block';
+      }
+      if (typeof Swal !== 'undefined') {
+        Swal.fire({
+          icon: 'error',
+          title: 'Kesalahan Jaringan / Server',
+          text: event.reason && event.reason.message ? event.reason.message : 'Terjadi kesalahan pada permintaan server.',
+          confirmButtonText: 'Tutup'
+        });
+      } else {
+        alert('Kesalahan jaringan/server: ' + (event.reason && event.reason.message ? event.reason.message : String(event.reason)));
+      }
+    } catch (err) {
+      // Fallback.
+    }
+    return false;
+  };
+
+  // Debug banner: tampilkan pesan error merah di bagian atas halaman jika ada error JS.
+  (function installDebugBanner() {
+    try {
+      var banner = document.createElement('div');
+      banner.id = 'wms-debug-banner';
+      banner.style.cssText =
+        'position:fixed;top:0;left:0;right:0;z-index:9999;background:#DC2626;color:#fff;' +
+        'font-size:0.75rem;padding:6px 12px;display:none;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.2);';
+      var closeBtn = document.createElement('span');
+      closeBtn.innerHTML = '&times;';
+      closeBtn.style.cssText = 'float:right;cursor:pointer;margin-left:10px;font-weight:bold;';
+      closeBtn.onclick = function () { banner.style.display = 'none'; };
+      banner.appendChild(closeBtn);
+      var msg = document.createElement('span');
+      banner.appendChild(msg);
+      document.body.insertBefore(banner, document.body.firstChild);
+      window._wmsDebugBanner = { el: banner, msg: msg };
+    } catch (e) {
+      // Tidak kritis.
+    }
+  })();
+
+  // Expose handleLogin ke global scope agar HTML onsubmit dapat memanggilnya.
+  window.handleLogin = function (event) {
+    event.preventDefault();
+
+    var username = (q('#login-username').value || '').trim();
+    var password = q('#login-password').value || '';
+    var remember = !!(q('#login-remember') && q('#login-remember').checked);
+
+    if (!username) {
+      showLoginError('Username wajib diisi.');
+      q('#login-username').focus();
+      return false;
+    }
+    if (!password) {
+      showLoginError('Password wajib diisi.');
+      q('#login-password').focus();
+      return false;
+    }
+
+    showLoginError('');
+    setLoginBusy(true);
+
+    google.script.run
+      .withSuccessHandler(function (session) {
+        if (!session) {
+          showLoginError('Server mengembalikan respons kosong (null). Pastikan database sudah diinisialisasi.');
+          setLoginBusy(false);
+          return;
+        }
+        storeToken(session.token, !!session.remember);
+        App.token = session.token;
+        enterApp(session);
+        toast('success', 'Login berhasil', 'Selamat datang, ' + (session.user ? session.user.NamaLengkap : username) + '.');
+        setLoginBusy(false);
+      })
+      .withFailureHandler(function (err) {
+        App.token = '';
+        showLoginError(err && err.message ? err.message : 'Login gagal. Silakan coba lagi.');
+        setLoginBusy(false);
+      })
+      .loginUser(username, password, remember);
+
+    return false;
+  };
+
+  function callApi(action, payload) {
+    var body = payload && typeof payload === 'object' ? payload : {};
+    if (App.token && !PUBLIC_ACTIONS[action] && !body._token) {
+      body = Object.assign({}, body, { _token: App.token });
+    }
+
+    return new Promise(function (resolve, reject) {
+      google.script.run
+        .withSuccessHandler(function (raw) {
+          var parsed;
+          try {
+            parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          } catch (err) {
+            reject(new Error('Respons server tidak valid.'));
+            return;
+          }
+          if (!parsed || parsed.ok !== true) {
+            var message = parsed && parsed.error ? parsed.error : 'Permintaan ke server gagal.';
+            if (!PUBLIC_ACTIONS[action] && /sesi|login kembali|tidak aktif/i.test(message)) {
+              handleSessionExpired(message);
+            }
+            reject(new Error(message));
+            return;
+          }
+          resolve(parsed.data);
+        })
+        .withFailureHandler(function (err) {
+          reject(new Error(err && err.message ? err.message : String(err)));
+        })
+        .executeApi(action, body);
+    });
+  }
+
+  function toNumberOrZero_(value) {
+    var number = Number(value);
+    return isFinite(number) ? number : 0;
+  }
+
+  /* ====================================================================== */
+  /* AUTHENTICATION / SESSION                                               */
+  /* ====================================================================== */
+
+  function normalizeRole(role) {
+    var value = String(role || '').trim().toUpperCase();
+    return value === 'ADMIN' ? 'ADMIN' : 'STAFF';
+  }
+
+  function getStoredToken() {
+    try {
+      return localStorage.getItem(AUTH_STORAGE.remember) || sessionStorage.getItem(AUTH_STORAGE.session) || '';
+    } catch (err) {
+      return '';
+    }
+  }
+
+  function storeToken(token, remember) {
+    try {
+      localStorage.removeItem(AUTH_STORAGE.remember);
+      sessionStorage.removeItem(AUTH_STORAGE.session);
+      if (!token) {
+        return;
+      }
+      if (remember) {
+        localStorage.setItem(AUTH_STORAGE.remember, token);
+      } else {
+        sessionStorage.setItem(AUTH_STORAGE.session, token);
+      }
+    } catch (err) {
+      // Ignore storage errors.
+    }
+  }
+
+  function clearStoredToken() {
+    try {
+      localStorage.removeItem(AUTH_STORAGE.remember);
+      sessionStorage.removeItem(AUTH_STORAGE.session);
+    } catch (err) {
+      // Ignore storage errors.
+    }
+  }
+
+  function can(permission) {
+    if (!permission) {
+      return true;
+    }
+    if (App.role === 'ADMIN') {
+      return true;
+    }
+    return App.permissions.indexOf(permission) >= 0;
+  }
+
+  function applySession(payload) {
+    if (!payload) {
+      throw new Error('Respons autentikasi tidak valid.');
+    }
+    App.token = payload.token || App.token;
+    App.user = payload.user || null;
+    App.role = normalizeRole(App.user ? App.user.Role : '');
+    App.permissions = payload.permissions || [];
+  }
+
+  function applyRoleUI() {
+    var name = App.user && App.user.NamaLengkap ? App.user.NamaLengkap : (App.user && App.user.Username ? App.user.Username : 'PT GEA');
+    var roleLabel = App.role === 'ADMIN' ? 'Administrator' : 'Staff Gudang';
+
+    setText('#user-name', name);
+    setText('#user-role', roleLabel);
+    setText('#user-avatar', initials(name));
+
+    var chip = q('#user-role-chip');
+    if (chip) {
+      chip.classList.toggle('role-admin', App.role === 'ADMIN');
+      chip.classList.toggle('role-staff', App.role !== 'ADMIN');
+      var chipText = q('#user-role-chip-text');
+      if (chipText) {
+        chipText.textContent = App.role;
+      }
+    }
+
+    qa('[data-permission]').forEach(function (element) {
+      element.classList.toggle('d-none', !can(element.getAttribute('data-permission')));
+    });
+    qa('[data-admin-only]').forEach(function (element) {
+      element.classList.toggle('d-none', App.role !== 'ADMIN');
+    });
+  }
+
+  function initials(name) {
+    var parts = String(name || 'G').trim().split(/\s+/).slice(0, 2);
+    return parts.map(function (part) { return part.charAt(0).toUpperCase(); }).join('') || 'G';
+  }
+
+  function showLoginError(message) {
+    var box = q('#login-error');
+    if (!box) {
+      return;
+    }
+    box.textContent = message || '';
+    box.classList.toggle('is-visible', !!message);
+  }
+
+  function setLoginBusy(busy) {
+    App.loginBusy = !!busy;
+    var button = q('#login-submit');
+    var label = q('#login-submit-text');
+    if (button) {
+      button.disabled = !!busy;
+    }
+    if (label) {
+      label.textContent = busy ? 'Memverifikasi...' : 'Masuk ke Dashboard';
+    }
+  }
+
+  function showLoginScreen(message) {
+    App.booted = false;
+    if (App.autoSyncTimer) {
+      clearInterval(App.autoSyncTimer);
+      App.autoSyncTimer = null;
+    }
+    document.body.classList.add('auth-mode');
+    var root = q('#app-root');
+    if (root) {
+      root.classList.remove('app-visible');
+    }
+    var screen = q('#login-screen');
+    if (screen) {
+      screen.classList.remove('is-leaving');
+    }
+    setLoginBusy(false);
+    showLoginError(message || '');
+  }
+
+  function handleSessionExpired(message) {
+    if (!App.token) {
+      return;
+    }
+    clearStoredToken();
+    App.token = '';
+    App.user = null;
+    App.permissions = [];
+    App.role = '';
+    showLoginScreen(message || 'Sesi berakhir. Silakan login kembali.');
+  }
+
+  function enterApp(sessionPayload) {
+    try {
+      applySession(sessionPayload);
+
+      // 1. Sembunyikan login screen (auth-mode) secepat mungkin.
+      document.body.classList.remove('auth-mode');
+      var screen = q('#login-screen');
+      if (screen) {
+        screen.classList.add('is-leaving');
+      }
+      // 2. Tampilkan aplikasi utama.
+      var root = q('#app-root');
+      if (root) {
+        root.classList.add('app-visible');
+      }
+      App.booted = true;
+
+      if (!App.eventsBound) {
+        bindEvents();
+        App.eventsBound = true;
+      }
+
+      // 3. Render info user (nama, role, avatar, permission UI).
+      try {
+        applyRoleUI();
+      } catch (roleErr) {
+        console.warn('applyRoleUI gagal (diabaikan):', roleErr);
+      }
+
+      // 4. Aktifkan tab default (dashboard, atau view lain jika diizinkan).
+      var target = App.initialView;
+      if (!VIEW_META[target] || !can(VIEW_META[target].permission)) {
+        target = 'dashboard';
+      }
+      showView(target, false);
+
+      if (App.dashboardInitError && !App.dashboardInitErrorShown) {
+        App.dashboardInitErrorShown = true;
+        Swal.fire({
+          icon: 'warning',
+          title: 'Inisialisasi Database',
+          text: App.dashboardInitError,
+          confirmButtonText: 'Mengerti'
+        });
+      }
+
+      // 5. Muat data awal (STOCK_BALANCE, MASTER_*, SYNC_LOGS terakhir).
+      loadInitialAppData()
+        .then(function () {
+          return loadOptions();
+        })
+        .then(function () {
+          populateAdjustmentForms();
+        })
+        .catch(function (err) {
+          setServerStatus('offline', 'Server Offline', '');
+          showError(err, 'Gagal Memuat Data Awal');
+        });
+
+      startPing();
+      startAutoSync();
+    } catch (err) {
+      console.error('enterApp error:', err);
+      // Jika gagal, tetap tampilkan login screen dengan pesan error.
+      showLoginError('Gagal memuat aplikasi: ' + (err && err.message ? err.message : String(err)));
+      try {
+        document.body.classList.add('auth-mode');
+        var root = q('#app-root');
+        if (root) {
+          root.classList.remove('app-visible');
+        }
+        var screen = q('#login-screen');
+        if (screen) {
+          screen.classList.remove('is-leaving');
+          screen.style.display = 'flex';
+        }
+      } catch (err2) {
+        console.error('enterApp fallback error:', err2);
+      }
+    }
+  }
+
+  function setRoleUiSafely() {
+    try {
+      applyRoleUI();
+    } catch (err) {
+      // UI must never block login because a decorative element is missing.
+    }
+  }
+
+  /**
+   * Handler login utama. Dipanggil oleh onsubmit pada form login.
+   * Wajib memanggil e.preventDefault() di baris pertama untuk mencegah
+   * native form submit yang menyebabkan URL sandbox menambahkan
+   * ?username=...&password=... dan layar menjadi kosong (blank).
+   */
+  function handleLogin(event) {
+    event.preventDefault();
+
+    var username = (q('#login-username').value || '').trim();
+    var password = q('#login-password').value || '';
+    var remember = !!(q('#login-remember') && q('#login-remember').checked);
+
+    if (!username) {
+      showLoginError('Username wajib diisi.');
+      q('#login-username').focus();
+      return false;
+    }
+    if (!password) {
+      showLoginError('Password wajib diisi.');
+      q('#login-password').focus();
+      return false;
+    }
+
+    showLoginError('');
+    setLoginBusy(true);
+
+    // Kirim login secara asynchronous langsung ke server-side loginUser,
+    // tidak melalui executeApi gateway, untuk menghindari JSON wrapping
+    // dan masalah serialisasi pada objek Date.
+    google.script.run
+      .withSuccessHandler(function (session) {
+        storeToken(session.token, !!session.remember);
+        App.token = session.token;
+        enterApp(session);
+        toast('success', 'Login berhasil', 'Selamat datang, ' + (session.user ? session.user.NamaLengkap : username) + '.');
+        setLoginBusy(false);
+      })
+      .withFailureHandler(function (err) {
+        App.token = '';
+        showLoginError(err && err.message ? err.message : 'Login gagal. Silakan coba lagi.');
+        setLoginBusy(false);
+      })
+      .loginUser(username, password, remember);
+
+    return false;
+  }
+
+  // submitLogin dapat dipanggil dengan 2 cara:
+  //   1. window.submitLogin()            <- dari onclick HTML, baca nilai dari DOM
+  //   2. window.submitLogin(u, p, r)     <- dipanggil langsung dengan parameter
+  window.submitLogin = function (username, password, remember) {
+    // Jika dipanggil tanpa parameter, ambil nilai langsung dari input DOM
+    if (username === undefined || password === undefined) {
+      var uEl = q('#login-username');
+      var pEl = q('#login-password');
+      var rEl = q('#login-remember');
+      username = (uEl && uEl.value) ? String(uEl.value).trim() : '';
+      password = (pEl && pEl.value) ? String(pEl.value) : '';
+      remember = !!(rEl && rEl.checked);
+    }
+
+    if (App.loginBusy) {
+      return;
+    }
+    showLoginError('');
+    setLoginBusy(true);
+
+    google.script.run
+      .withSuccessHandler(function (session) {
+        if (!session) {
+          showLoginError('Server mengembalikan respons kosong (null). Pastikan database sudah diinisialisasi.');
+          setLoginBusy(false);
+          return;
+        }
+        storeToken(session.token, !!session.remember);
+        App.token = session.token;
+        enterApp(session);
+        toast('success', 'Login berhasil', 'Selamat datang, ' + (session.user ? session.user.NamaLengkap : username) + '.');
+        setLoginBusy(false);
+      })
+      .withFailureHandler(function (err) {
+        App.token = '';
+        showLoginError(err.message || 'Login gagal.');
+        setLoginBusy(false);
+      })
+      .loginUser(username, password, remember);
+  };
+
+  function restoreLogin() {
+    var token = getStoredToken();
+    if (!token) {
+      showLoginScreen('');
+      return false;
+    }
+
+    App.token = token;
+    setLoginBusy(true);
+    callApi('restoreSession', { token: token })
+      .then(function (session) {
+        enterApp(session);
+        setLoginBusy(false);
+        return true;
+      })
+      .catch(function () {
+        clearStoredToken();
+        App.token = '';
+        showLoginScreen('');
+        setLoginBusy(false);
+      });
+    return true;
+  }
+
+  function logoutUser() {
+    var token = App.token;
+    function finish() {
+      clearStoredToken();
+      App.token = '';
+      App.user = null;
+      App.role = '';
+      App.permissions = [];
+      App.loaded = {};
+      App.cache = {
+        stockLogs: null,
+        inboundReceiving: null,
+        quarantine: null,
+        claims: null,
+        outboundOrders: null,
+        pickingList: null,
+        dispatchManifest: null,
+        soHeader: null,
+        soDetail: null,
+        syncHistory: null,
+        masterItems: null,
+        masterLocations: null,
+        masterSuppliers: null,
+        masterOutlets: null,
+        masterUsers: null
+      };
+      showLoginScreen('');
+      if (location && typeof location.reload === 'function') {
+        try {
+          location.reload();
+          return;
+        } catch (err) {
+          // Fall through to the in-page login screen.
+        }
+      }
+    }
+
+    if (!token) {
+      finish();
+      return;
+    }
+    callApi('logoutUser', { token: token }).then(finish, finish);
+  }
+
+  /* ====================================================================== */
+  /* LOADING / TOAST / STATUS                                               */
+  /* ====================================================================== */
+
+  function showLoading(text) {
+    q('#loading-text').textContent = text || 'Memproses...';
+    q('#loading-overlay').classList.remove('d-none');
+  }
+
+  function hideLoading() {
+    q('#loading-overlay').classList.add('d-none');
+  }
+
+  function withLoading(promise, text) {
+    showLoading(text);
+    return promise.then(function (value) {
+      hideLoading();
+      return value;
+    }, function (err) {
+      hideLoading();
+      throw err;
+    });
+  }
+
+  function toast(icon, title, text) {
+    Swal.fire({
+      toast: true,
+      position: 'top-end',
+      icon: icon,
+      title: title,
+      text: text || '',
+      showConfirmButton: false,
+      timer: 3400,
+      timerProgressBar: true
+    });
+  }
+
+  function showError(err, title) {
+    var message = err && err.message ? err.message : String(err);
+    Swal.fire({
+      icon: 'error',
+      title: title || 'Terjadi Kesalahan',
+      text: message,
+      confirmButtonText: 'Tutup'
+    });
+  }
+
+  function setServerStatus(state, text, time) {
+    var wrap = q('#server-status');
+    var label = q('#server-status-text');
+    var timeLabel = q('#server-status-time');
+    if (wrap) {
+      wrap.classList.remove('is-online', 'is-offline');
+      if (state === 'online') {
+        wrap.classList.add('is-online');
+      } else if (state === 'offline') {
+        wrap.classList.add('is-offline');
+      }
+    }
+    if (label) {
+      label.textContent = text || (state === 'online' ? 'Server Online' : state === 'offline' ? 'Server Offline' : 'Menghubungkan...');
+    }
+    if (timeLabel) {
+      timeLabel.textContent = time ? 'Sync ' + shortDate(time).slice(11) : '-';
+    }
+  }
+
+  function markSync() {
+    var now = new Date();
+    var text = now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    var el = q('#last-sync');
+    if (el) {
+      el.textContent = 'Sinkron terakhir ' + text;
+    }
+  }
+
+  function setText(selector, value) {
+    var el = q(selector);
+    if (el) {
+      el.textContent = value === null || value === undefined || value === '' ? '-' : String(value);
+    }
+  }
+
+  function emptyRow(cols, text) {
+    return '<tr><td colspan="' + cols + '" class="empty-state"><i class="fa-regular fa-folder-open"></i>' + esc(text) + '</td></tr>';
+  }
+
+  function setTableLoading(tbody, cols, text) {
+    if (tbody) {
+      tbody.innerHTML = '<tr><td colspan="' + cols + '" class="empty-state"><span class="spinner-border spinner-border-sm me-2"></span>' + esc(text || 'Memuat data...') + '</td></tr>';
+    }
+  }
+
+  /* ====================================================================== */
+  /* INITIAL APP DATA (light load, < 2 detik)                               */
+  /* ====================================================================== */
+
+  function loadInitialAppData() {
+    if (App.dashboardPromise) {
+      return App.dashboardPromise;
+    }
+
+    setServerStatus('connecting', 'Menghubungkan...', '');
+    App.dashboardPromise = callApi('getInitialAppData')
+      .then(function (data) {
+        if (!data) {
+          throw new Error('Server mengembalikan data kosong (null). Pastikan database sudah diinisialisasi.');
+        }
+        App.dashboard = data;
+        App.loaded.dashboard = true;
+        applyInitialAppData(data);
+        setServerStatus('online', 'Server Online', data.sync ? data.sync.serverTime : '');
+        return data;
+      })
+      .catch(function (err) {
+        setServerStatus('offline', 'Server Offline', '');
+        App.dashboardInitError = err && err.message ? err.message : String(err);
+        throw err;
+      })
+      .then(function (value) {
+        App.dashboardPromise = null;
+        return value;
+      }, function (err) {
+        App.dashboardPromise = null;
+        throw err;
+      });
+
+    return App.dashboardPromise;
+  }
+
+  function applyInitialAppData(data) {
+    if (!data) {
+      data = { items: [], balance: [], sync: null };
+    }
+    var summary = {
+      totalSku: (data.items || []).length,
+      activeSku: (data.items || []).filter(function (it) { return normalizeKey_(it.Status) === 'ACTIVE'; }).length,
+      totalStockQty: 0,
+      lowStockCount: 0
+    };
+    var critical = [];
+    (data.balance || []).forEach(function (row) {
+      var akhir = toNumberOrZero_(row.SaldoAkhir);
+      var min = toNumberOrZero_(row.MinStock);
+      summary.totalStockQty += akhir;
+      if (min > 0 && akhir < min) {
+        summary.lowStockCount += 1;
+        critical.push(row);
+      }
+    });
+
+    setText('#stat-total-sku', fmtNum(summary.totalSku));
+    setText('#stat-total-sku-note', fmtNum(summary.activeSku) + ' SKU aktif');
+    setText('#stat-inbound-today', '-');
+    setText('#stat-inbound-note', 'Penerimaan AppSheet');
+    setText('#stat-outbound-active', '-');
+    setText('#stat-outbound-note', 'Order belum selesai');
+    setText('#stat-sync-status', data.sync && data.sync.lastSyncAt ? 'ONLINE' : '-');
+    setText('#stat-sync-note', data.sync && data.sync.lastSyncAt ? 'Terakhir ' + shortDate(data.sync.lastSyncAt) : 'Belum pernah');
+
+    renderDashboardCritical(critical.slice(0, 8));
+    renderDashboardOutbound([]);
+
+    if (App.user) {
+      applyRoleUI();
+    } else {
+      setText('#user-name', displayUserName(data.sync ? data.sync.userEmail : App.userEmail));
+    }
+
+    var sheetLink = q('#sidebar-sheet-link');
+    if (sheetLink && data.sync && data.sync.spreadsheetUrl) {
+      sheetLink.href = data.sync.spreadsheetUrl;
+    }
+    setText('#sidebar-sheet-name', (data.sync && data.sync.spreadsheetName) || 'Spreadsheet WMS');
+    setText('#last-sync', data.sync && data.sync.lastSyncAt ? 'Sinkron terakhir ' + shortDate(data.sync.lastSyncAt) : 'Belum disinkronkan');
+
+    // Cache master data yang ringan.
+    App.cache.masterItems = data.items || [];
+    App.cache.masterLocations = data.locations || [];
+    App.cache.masterSuppliers = data.suppliers || [];
+    App.cache.masterOutlets = data.outlets || [];
+  }
+
+  function displayUserName(email) {
+    var text = String(email || '').trim();
+    if (!text) {
+      return 'PT GEA';
+    }
+    var local = text.split('@')[0].replace(/[._-]+/g, ' ');
+    return local.replace(/\b\w/g, function (char) { return char.toUpperCase(); });
+  }
+
+  function renderDashboardCritical(rows) {
+    var tbody = q('#dashboard-critical-body');
+    if (!tbody) {
+      return;
+    }
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(6, 'Tidak ada stok kritis.');
+      return;
+    }
+    tbody.innerHTML = rows.map(function (row) {
+      var tone = normalizeKey_(row.Status) === 'EMPTY' ? 'tone-danger' : 'tone-warning';
+      return '<tr>' +
+        '<td class="cell-strong">' + esc(row.SKU) + '</td>' +
+        '<td>' + esc(row.NamaBarang || '-') + '</td>' +
+        '<td>' + esc(row.LokasiID || '-') + '<span class="cell-sub">' + esc(row.Zone || '-') + '</span></td>' +
+        '<td class="text-end">' + fmtNum(row.SaldoAkhir) + '</td>' +
+        '<td>' + statusBadge(row.Status) + '</td>' +
+        '<td class="text-end">' +
+        '<button type="button" class="btn btn-outline-secondary btn-icon" title="Kartu stok" data-action="stock-card" data-sku="' + esc(row.SKU) + '"><i class="fa-solid fa-clock-rotate-left"></i></button>' +
+        '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function renderDashboardOutbound(rows) {
+    var tbody = q('#dashboard-outbound-body');
+    if (!tbody) {
+      return;
+    }
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(6, 'Belum ada order outbound.');
+      return;
+    }
+    tbody.innerHTML = rows.map(function (row) {
+      return '<tr>' +
+        '<td class="cell-strong">' + esc(row.OrderID) + '</td>' +
+        '<td>' + esc(row.NoPO || '-') + '</td>' +
+        '<td>' + esc(row.NamaOutlet || row.OutletID || '-') + '</td>' +
+        '<td class="cell-muted">' + esc(shortDate(row.TanggalOrder)) + '</td>' +
+        '<td>' + statusBadge(row.StatusOrder) + '</td>' +
+        '<td class="text-end">' +
+        '<button type="button" class="btn btn-outline-secondary btn-icon" title="Detail" data-action="outbound-detail" data-id="' + esc(row.OrderID) + '"><i class="fa-solid fa-eye"></i></button>' +
+        '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  /* ====================================================================== */
+  /* OPTIONS / MASTER CACHE                                                 */
+  /* ====================================================================== */
+
+  function loadOptions() {
+    if (App.options) {
+      return Promise.resolve(App.options);
+    }
+    if (App.optionsPromise) {
+      return App.optionsPromise;
+    }
+    App.optionsPromise = callApi('getFormOptions')
+      .then(function (options) {
+        App.options = options;
+        populateAdjustmentForms();
+        return options;
+      })
+      .then(function (value) {
+        App.optionsPromise = null;
+        return value;
+      }, function (err) {
+        App.optionsPromise = null;
+        throw err;
+      });
+    return App.optionsPromise;
+  }
+
+  function populateAdjustmentForms() {
+    if (!App.options) {
+      return;
+    }
+    var itemHtml = itemOptions('');
+    ['#adjust-sku', '#transfer-sku'].forEach(function (selector) {
+      var select = q(selector);
+      if (select) {
+        var current = select.value;
+        select.innerHTML = itemHtml;
+        if (current) {
+          select.value = current;
+        }
+      }
+    });
+
+    var adjustLocation = q('#adjust-location');
+    if (adjustLocation) {
+      var currentAdjust = adjustLocation.value;
+      adjustLocation.innerHTML = locationOptions('', 'Pilih lokasi...');
+      if (currentAdjust) {
+        adjustLocation.value = currentAdjust;
+      }
+    }
+    var fromLocation = q('#transfer-from');
+    if (fromLocation) {
+      fromLocation.innerHTML = locationOptions('', 'Pilih lokasi asal...');
+    }
+    var toLocation = q('#transfer-to');
+    if (toLocation) {
+      toLocation.innerHTML = locationOptions('', 'Pilih lokasi tujuan...');
+    }
+  }
+
+  function itemOptions(selected) {
+    var html = '<option value="">Pilih SKU...</option>';
+    ((App.options && App.options.items) || []).forEach(function (item) {
+      html += '<option value="' + esc(item.SKU) + '"' + (selected === item.SKU ? ' selected' : '') + '>' +
+        esc(item.SKU) + ' - ' + esc(item.NamaBarang) + '</option>';
+    });
+    return html;
+  }
+
+  function locationOptions(selected, emptyLabel) {
+    var html = '<option value="">' + esc(emptyLabel || 'Pilih lokasi...') + '</option>';
+    ((App.options && App.options.locations) || []).forEach(function (location) {
+      var lokasiID = location.LokasiID || location.LocationID || '';
+      html += '<option value="' + esc(lokasiID) + '"' + (selected === lokasiID ? ' selected' : '') + '>' +
+        esc(lokasiID) + ' - ' + esc(location.Area || location.Zone) + '</option>';
+    });
+    return html;
+  }
+
+  function todayValue() {
+    var now = new Date();
+    return now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+  }
+
+  /* ====================================================================== */
+  /* INVENTORY: MONITORING STOK (fast read endpoint)                        */
+  /* ====================================================================== */
+
+  function loadStockMonitoring(force) {
+    var state = App.states.stockMonitor;
+    if (App.loaded.stockMonitor && !force) {
+      renderStockMonitorTable();
+      renderStockMonitorFooter();
+      renderStockMonitorPager();
+      renderStockMonitorStatusChips();
+      return Promise.resolve();
+    }
+    var tbody = q('#stock-monitor-body');
+    setTableLoading(tbody, 8, 'Memuat monitoring stok...');
+
+    return callApi('getStockMonitoringData')
+      .then(function (result) {
+        state.allRows = result.rows || [];
+        state.filteredRows = state.allRows.slice();
+        state.page = 1;
+        applyStockMonitorFilters();
+        renderStockMonitorTable();
+        renderStockMonitorFooter();
+        renderStockMonitorPager();
+        renderStockMonitorStatusChips();
+        populateKategoriFilter();
+        App.loaded.stockMonitor = true;
+      }).catch(function (err) {
+        q('#stock-monitor-body').innerHTML = emptyRow(8, 'Gagal memuat: ' + err.message);
+      });
+  }
+
+  function populateKategoriFilter() {
+    var select = q('#stock-monitor-kategori');
+    if (!select || !App.options) {
+      return;
+    }
+    var current = select.value;
+    var html = '<option value="">Semua Kategori</option><option value="(blank)">Tanpa Kategori</option>';
+    ((App.options.categories || []).slice().sort()).forEach(function (cat) {
+      html += '<option value="' + esc(cat) + '">' + esc(cat) + '</option>';
+    });
+    select.innerHTML = html;
+    if (current) {
+      select.value = current;
+    }
+  }
+
+  function applyStockMonitorFilters() {
+    var state = App.states.stockMonitor;
+    var f = App.filters.stockMonitor;
+    var search = normalizeKey_(f.search);
+    var kategori = f.kategori;
+    var status = f.status;
+
+    state.filteredRows = state.allRows.filter(function (row) {
+      if (search) {
+        var haystack = normalizeKey_(row.SKU + ' ' + row.NamaBarang + ' ' + row.Kategori + ' ' + row.LokasiID);
+        if (haystack.indexOf(search) < 0) {
+          return false;
+        }
+      }
+      if (kategori) {
+        if (kategori === '(blank)') {
+          if (normalizeKey_(row.Kategori)) {
+            return false;
+          }
+        } else if (normalizeKey_(row.Kategori) !== normalizeKey_(kategori)) {
+          return false;
+        }
+      }
+      if (status && normalizeKey_(row.Status) !== normalizeKey_(status)) {
+        return false;
+      }
+      return true;
+    });
+    state.page = 1;
+  }
+
+  function renderStockMonitorTable() {
+    var tbody = q('#stock-monitor-body');
+    var state = App.states.stockMonitor;
+    var start = (state.page - 1) * state.pageSize;
+    var pageRows = state.filteredRows.slice(start, start + state.pageSize);
+
+    if (!pageRows.length) {
+      tbody.innerHTML = emptyRow(7, 'Tidak ada saldo stok yang cocok.');
+      q('#stock-monitor-footer').innerHTML = '';
+      return;
+    }
+
+    tbody.innerHTML = pageRows.map(function (row) {
+      var saldoAkhir = Number(row.SaldoAkhir) || 0;
+      var status = normalizeKey_(row.Status) || 'NORMAL';
+      var lokasiID = row.LokasiID || row.RakDefault || '-';
+      var actions = '<div class="col-aksi text-center">' +
+        '<button type="button" class="btn btn-outline-secondary btn-icon" title="Buka Kartu Stok" data-action="stock-card" data-sku="' + esc(row.SKU) + '"><i class="fa-solid fa-clock-rotate-left"></i></button>' +
+        (can('adjustment') ? '<button type="button" class="btn btn-outline-secondary btn-icon" title="Adjustment" data-action="stock-adjust" data-sku="' + esc(row.SKU) + '" data-location="' + esc(lokasiID) + '"><i class="fa-solid fa-sliders"></i></button>' : '') +
+        '</div>';
+      var masuk = Number(row.SaldoMasuk) || 0;
+      var keluar = Number(row.SaldoKeluar) || 0;
+      var masukText = masuk > 0 ? '<span class="qty-positive">+' + fmtNum(masuk) + '</span>' : fmtNum(masuk);
+      var keluarText = keluar > 0 ? '<span class="qty-negative">-' + fmtNum(keluar) + '</span>' : fmtNum(keluar);
+      var statusTone = stockStatusTone_(status);
+      return '<tr>' +
+        '<td class="col-sku cell-strong">' + esc(row.SKU) + '</td>' +
+        '<td class="col-nama">' +
+          '<div class="cell-nama-barang">' +
+            '<div class="main">' + esc(row.NamaBarang || '-') + '</div>' +
+            '<div class="cell-sub">Lokasi: ' + esc(lokasiID) + ' &middot; Rak: ' + esc(row.RakDefault || '-') + '</div>' +
+            '<span class="status-badge ' + statusTone + '">' + esc(status) + '</span>' +
+          '</div>' +
+        '</td>' +
+        '<td class="text-end cell-strong col-saldo-awal">' + fmtNum(row.SaldoAwal) + '</td>' +
+        '<td class="text-end qty-positive col-saldo-masuk">' + masukText + '</td>' +
+        '<td class="text-end qty-negative col-saldo-keluar">' + keluarText + '</td>' +
+        '<td class="text-end cell-strong col-saldo-akhir">Saldo ' + fmtNum(saldoAkhir) + ' ' + esc(row.Satuan || '') + '</td>' +
+        '<td class="col-aksi text-center">' + actions + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  function renderStockMonitorFooter() {
+    var footer = q('#stock-monitor-footer');
+    var state = App.states.stockMonitor;
+    var rows = state.filteredRows;
+    if (!footer) {
+      return;
+    }
+    var totalAwal = rows.reduce(function (t, r) { return t + Number(r.SaldoAwal || 0); }, 0);
+    var totalMasuk = rows.reduce(function (t, r) { return t + Number(r.SaldoMasuk || 0); }, 0);
+    var totalKeluar = rows.reduce(function (t, r) { return t + Number(r.SaldoKeluar || 0); }, 0);
+    var totalAkhir = rows.reduce(function (t, r) { return t + Number(r.SaldoAkhir || 0); }, 0);
+    footer.innerHTML =
+      '<tr>' +
+      '<td colspan="2" class="text-start"><strong>Total (' + fmtNum(rows.length) + ' item terfilter)</strong></td>' +
+      '<td class="text-end cell-strong">' + fmtNum(totalAwal) + '</td>' +
+      '<td class="text-end qty-positive">+' + fmtNum(totalMasuk) + '</td>' +
+      '<td class="text-end qty-negative">-' + fmtNum(totalKeluar) + '</td>' +
+      '<td class="text-end cell-strong">Saldo ' + fmtNum(totalAkhir) + '</td>' +
+      '<td class="col-aksi text-end"></td>' +
+      '</tr>';
+  }
+
+  function renderStockMonitorStatusChips() {
+    var container = q('#stock-monitor-status-chips');
+    var state = App.states.stockMonitor;
+    var f = App.filters.stockMonitor;
+    var all = state.allRows || [];
+    var counts = { ALL: all.length, EMPTY: 0, LOW: 0, NORMAL: 0, OVERSTOCK: 0 };
+    all.forEach(function (row) {
+      var st = normalizeKey_(row.Status);
+      if (counts[st] !== undefined) {
+        counts[st] += 1;
+      }
+    });
+    var chips = [
+      { key: 'ALL', label: 'ALL', count: counts.ALL },
+      { key: 'EMPTY', label: 'EMPTY', count: counts.EMPTY },
+      { key: 'LOW', label: 'LOW', count: counts.LOW },
+      { key: 'NORMAL', label: 'NORMAL', count: counts.NORMAL },
+      { key: 'OVERSTOCK', label: 'OVERSTOCK', count: counts.OVERSTOCK }
+    ];
+    container.innerHTML = chips.map(function (c) {
+      var isActive = f.status === c.key || (f.status === '' && c.key === 'ALL');
+      return '<button type="button" class="status-chip status-' + c.key + (isActive ? ' is-active' : '') + '" data-status="' + c.key + '">' +
+        esc(c.label) + '<span class="chip-count">' + fmtNum(c.count) + '</span></button>';
+    }).join('');
+  }
+
+  function renderStockMonitorPager() {
+    var container = q('#stock-monitor-pager');
+    var state = App.states.stockMonitor;
+    var f = App.filters.stockMonitor;
+    var total = state.filteredRows.length;
+    var totalPages = Math.max(Math.ceil(total / f.pageSize), 1);
+    var page = Math.min(state.page || 1, totalPages);
+    var start = total ? (page - 1) * f.pageSize + 1 : 0;
+    var end = total ? Math.min(page * f.pageSize, total) : 0;
+    container.innerHTML =
+      '<div class="pager-info">Menampilkan <strong>' + start + '-' + end + '</strong> dari <strong>' + fmtNum(total) + '</strong> item</div>' +
+      '<div class="pager-controls">' +
+      '<label class="control-label small" style="margin-bottom:0;">Per halaman</label>' +
+      '<select class="form-select form-control-sm monitor-page-size" style="width:80px; min-height:30px;">' +
+      '<option value="25"' + (f.pageSize === 25 ? ' selected' : '') + '>25</option>' +
+      '<option value="50"' + (f.pageSize === 50 ? ' selected' : '') + '>50</option>' +
+      '<option value="100"' + (f.pageSize === 100 ? ' selected' : '') + '>100</option>' +
+      '</select>' +
+      '<button type="button" class="btn btn-outline-secondary" data-page="prev"' + (page > 1 ? '' : ' disabled') + '><i class="fa-solid fa-chevron-left"></i></button>' +
+      '<span class="pager-page">Halaman ' + page + ' / ' + totalPages + '</span>' +
+      '<button type="button" class="btn btn-outline-secondary" data-page="next"' + (page < totalPages ? '' : ' disabled') + '><i class="fa-solid fa-chevron-right"></i></button>' +
+      '</div>';
+  }
+
+  function exportMonitorCsv() {
+    var state = App.states.stockMonitor;
+    var f = App.filters.stockMonitor;
+    var rows = state.filteredRows.length ? state.filteredRows : state.allRows;
+    if (!rows.length) {
+      toast('warning', 'Tidak ada data', 'Tidak ada data yang dapat diekspor.');
+      return;
+    }
+    var headers = ['SKU', 'Nama Barang', 'Saldo Awal', 'Masuk', 'Keluar', 'Saldo Akhir', 'Status'];
+    var lines = [headers.join(',')];
+    rows.forEach(function (row) {
+      lines.push([
+        row.SKU, row.NamaBarang,
+        row.SaldoAwal,
+        (Number(row.SaldoMasuk) || 0) > 0 ? '+' + fmtNum(row.SaldoMasuk) : fmtNum(row.SaldoMasuk),
+        (Number(row.SaldoKeluar) || 0) > 0 ? '-' + fmtNum(row.SaldoKeluar) : fmtNum(row.SaldoKeluar),
+        row.SaldoAkhir, row.Status
+      ].map(function (v) { return '"' + String(v === null || v === undefined ? '' : v).replace(/"/g, '""') + '"'; }).join(','));
+    });
+    var blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'monitoring-stok-' + new Date().toISOString().slice(0, 10) + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast('success', 'Diekspor', fmtNum(rows.length) + ' baris diunduh sebagai CSV.');
+  }
+
+  /* ====================================================================== */
+  /* INVENTORY: KARTU STOK (fast read endpoint)                             */
+  /* ====================================================================== */
+
+  function loadStockCard() {
+    var state = App.states.stockCard;
+    var f = App.filters.stockCard;
+    var tbody = q('#stock-card-body');
+    var wrap = q('#stock-card-summary-wrap');
+    var toolbar = q('#stock-card-toolbar');
+    var pager = q('#stock-card-pager');
+    var emptyHint = q('#stock-card-empty-hint');
+
+    if (!f.sku) {
+      tbody.innerHTML = emptyRow(7, 'Pilih Produk/SKU dari Monitoring Stok untuk melihat kartu stok.');
+      if (wrap) wrap.classList.add('d-none');
+      if (toolbar) toolbar.style.display = 'none';
+      if (pager) pager.innerHTML = '';
+      if (emptyHint) emptyHint.style.display = 'none';
+      return Promise.resolve();
+    }
+
+    setTableLoading(tbody, 8, 'Memuat kartu stok...');
+    if (wrap) wrap.classList.add('d-none');
+    if (toolbar) toolbar.style.display = 'none';
+    if (pager) pager.innerHTML = '';
+    if (emptyHint) emptyHint.style.display = 'none';
+
+    var filters = {
+      sku: f.sku,
+      kategori: f.kategori,
+      startDate: f.startDate,
+      endDate: f.endDate,
+      tipe: f.tipe
+    };
+
+    return callApi('getStockCardData', filters)
+      .then(function (result) {
+        state.allRows = result.rows || [];
+        state.summary = result.summary || {};
+
+        // Deteksi anomali audit.
+        state.allRows.forEach(function (row, idx) {
+          var anom = toNumberOrZero_(row.SaldoAwal) < 0;
+          if (!anom && idx > 0) {
+            var prev = state.allRows[idx - 1];
+            if (Math.abs(toNumberOrZero_(prev.SaldoAkhir) - toNumberOrZero_(row.SaldoAwal)) > 0.0001) {
+              anom = true;
+            }
+          }
+          row._anomaly = anom;
+        });
+
+        var hasSku = !!f.sku;
+        if (wrap) {
+          wrap.classList.toggle('d-none', !hasSku || !state.allRows.length);
+        }
+        if (toolbar) {
+          toolbar.style.display = hasSku ? '' : 'none';
+        }
+
+        if (!state.allRows.length) {
+          tbody.innerHTML = emptyRow(7, 'Tidak ada mutasi stok pada filter yang dipilih.');
+          if (emptyHint) emptyHint.style.display = '';
+          if (pager) pager.innerHTML = '';
+          renderCardSummary();
+          return;
+        }
+        if (emptyHint) emptyHint.style.display = 'none';
+
+        renderCardSummary();
+        renderStockCardTable();
+        renderStockCardPager();
+        App.loaded.stockCard = true;
+      }).catch(function (err) {
+        tbody.innerHTML = emptyRow(7, 'Gagal memuat: ' + err.message);
+      });
+  }
+
+  function renderCardSummary() {
+    var state = App.states.stockCard;
+    var s = state.summary || {};
+    setText('#card-total-masuk', fmtNum(s.totalMasuk || 0));
+    setText('#card-total-keluar', fmtNum(s.totalKeluar || 0));
+    setText('#card-saldo-akhir', fmtNum(s.saldoBerjalan !== undefined ? s.saldoBerjalan : (s.saldoAkhirAkhir || 0)));
+  }
+
+  function renderStockCardTable() {
+    var tbody = q('#stock-card-body');
+    var state = App.states.stockCard;
+    var f = App.filters.stockCard;
+    var start = (state.page - 1) * f.pageSize;
+    var pageRows = state.allRows.slice(start, start + f.pageSize);
+
+    if (!pageRows.length) {
+      tbody.innerHTML = emptyRow(7, 'Tidak ada mutasi stok.');
+      return;
+    }
+
+    tbody.innerHTML = pageRows.map(function (row) {
+      var ts = fmtTglHm(row.Timestamp);
+      var anomaly = row._anomaly ? ' table-anomaly' : '';
+      var tipe = normalizeKey_(row.Tipe);
+      var tipeTone = tipe === 'IN' ? 'IN' : tipe === 'OUT' ? 'OUT' : tipe === 'ADJUST' ? 'ADJUST' : tipe === 'TRANSFER' ? 'TRANSFER' : tipe === 'SO' ? 'SO' : 'OPNAME';
+      var sourceMeta = stockSourceMeta_(row.Source);
+      var masuk = Number(row.QtyMasuk) || 0;
+      var keluar = Number(row.QtyKeluar) || 0;
+      var masukText = masuk > 0 ? '<span class="qty-positive">+' + fmtNum(masuk) + '</span>' : fmtNum(masuk);
+      var keluarText = keluar > 0 ? '<span class="qty-negative">-' + fmtNum(keluar) + '</span>' : fmtNum(keluar);
+      var pending = normalizeKey_(row.ConfirmStatus) === 'PENDING' || tipe === 'OPNAME';
+      var confirmBtn = pending
+        ? '<button type="button" class="btn btn-success btn-icon btn-confirm-stock" title="Konfirmasi / tolak aksi" data-action="stock-log-confirm" data-id="' + esc(row.LogID) + '" data-tipe="' + esc(tipe) + '" data-refdoc="' + esc(row.RefDoc || '') + '" data-sku="' + esc(row.SKU || '') + '" data-lokasi="' + esc(row.LokasiID || '') + '" data-from="' + esc(row.LokasiID || '') + '" data-to="' + esc(row.ToLokasiID || '') + '"><i class="fa-solid fa-check"></i></button>'
+        : '<span class="cell-muted">-</span>';
+      return '<tr class="' + anomaly.trim() + '">' +
+        '<td class="col-waktu cell-muted">' + esc(ts) + '</td>' +
+        '<td class="col-refdoc">' + esc(row.RefDoc || '-') + ' <span class="badge-source ' + sourceMeta.cls + '">' + esc(sourceMeta.label) + '</span></td>' +
+        '<td class="col-tipe text-center"><span class="badge-tipe ' + tipeTone + '">' + esc(tipeTone) + '</span></td>' +
+        '<td class="col-masuk text-end">' + masukText + '</td>' +
+        '<td class="col-keluar text-end">' + keluarText + '</td>' +
+        '<td class="col-saldo-akhir text-end cell-strong">' + fmtNum(row.SaldoAkhir) + '</td>' +
+        '<td class="col-user cell-muted">' + esc(row.User || '-') + (pending ? confirmBtn : '') + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  function renderStockCardPager() {
+    var container = q('#stock-card-pager');
+    var state = App.states.stockCard;
+    var f = App.filters.stockCard;
+    var total = state.allRows.length;
+    var totalPages = Math.max(Math.ceil(total / f.pageSize), 1);
+    var page = Math.min(state.page || 1, totalPages);
+    var start = total ? (page - 1) * f.pageSize + 1 : 0;
+    var end = total ? Math.min(page * f.pageSize, total) : 0;
+    container.innerHTML =
+      '<div class="pager-info">Menampilkan <strong>' + start + '-' + end + '</strong> dari <strong>' + fmtNum(total) + '</strong> mutasi</div>' +
+      '<div class="pager-controls card-pager">' +
+      '<div class="page-size-wrap"><label>Per halaman</label>' +
+      '<select class="card-page-size">' +
+      '<option value="25"' + (f.pageSize === 25 ? ' selected' : '') + '>25</option>' +
+      '<option value="50"' + (f.pageSize === 50 ? ' selected' : '') + '>50</option>' +
+      '<option value="100"' + (f.pageSize === 100 ? ' selected' : '') + '>100</option>' +
+      '</select></div>' +
+      '<button type="button" class="btn btn-outline-secondary" data-page="prev"' + (page > 1 ? '' : ' disabled') + '><i class="fa-solid fa-chevron-left"></i></button>' +
+      '<span class="pager-page">Halaman ' + page + ' / ' + totalPages + '</span>' +
+      '<button type="button" class="btn btn-outline-secondary" data-page="next"' + (page < totalPages ? '' : ' disabled') + '><i class="fa-solid fa-chevron-right"></i></button>' +
+      '</div>';
+  }
+
+  function openStockLogConfirm(actionButton) {
+    var logID = actionButton.getAttribute('data-id');
+    var tipe = normalizeKey_(actionButton.getAttribute('data-tipe'));
+    var refDoc = actionButton.getAttribute('data-refdoc') || '';
+    var sku = actionButton.getAttribute('data-sku') || '';
+    var lokasiID = actionButton.getAttribute('data-lokasi') || '';
+    var fromLocationID = actionButton.getAttribute('data-from') || lokasiID;
+    var toLocationID = actionButton.getAttribute('data-to') || '';
+
+    var actionText = tipe === 'ADJUST'
+      ? 'Konfirmasi Adjustment Stok?'
+      : (tipe === 'TRANSFER' ? 'Konfirmasi Transfer Stok?' : 'Konfirmasi Persetujuan Stock Opname (BASO)?');
+
+    Swal.fire({
+      icon: 'question',
+      title: actionText,
+      html: '<p>Mutasi <strong>' + esc(refDoc || logID) + '</strong> akan diproses.</p>' +
+        '<p class="text-muted small mb-0">SKU: <strong>' + esc(sku) + '</strong> &middot; Tipe: <strong>' + esc(tipe) + '</strong></p>',
+      showCancelButton: true,
+      confirmButtonText: 'Konfirmasi',
+      cancelButtonText: 'Batal'
+    }).then(function (answer) {
+      if (!answer || !answer.isConfirmed) {
+        return;
+      }
+      var confirmedBy = App.user ? (App.user.NamaLengkap || App.user.Username) : '';
+      if (tipe === 'ADJUST') {
+        return withLoading(callApi('confirmStockAction', {
+          action: 'ADJUSTMENT',
+          sku: sku,
+          lokasiID: lokasiID,
+          qty: (function () { var r0 = (App.cache.stockLogs || []).filter(function (r) { return String(r.LogID) === String(logID); })[0] || {}; return (Number(r0.QtyMasuk) || 0) - (Number(r0.QtyKeluar) || 0); })(),
+          refDoc: refDoc || 'ADJ',
+          reason: 'Konfirmasi manual adjustment ' + refDoc,
+          confirm: true,
+          confirmedBy: confirmedBy
+        }), 'Mengecek adjustment...');
+      }
+      if (tipe === 'TRANSFER') {
+        return withLoading(callApi('confirmStockAction', {
+          action: 'TRANSFER',
+          sku: sku,
+          fromLocationID: fromLocationID,
+          toLocationID: toLocationID,
+          qty: (function () { var r0 = (App.cache.stockLogs || []).filter(function (r) { return String(r.LogID) === String(logID); })[0] || {}; return (Number(r0.QtyMasuk) || 0) - (Number(r0.QtyKeluar) || 0); })(),
+          refDoc: refDoc || 'TRF',
+          reason: 'Konfirmasi manual transfer ' + refDoc,
+          confirm: true,
+          confirmedBy: confirmedBy
+        }), 'Mengecek transfer...');
+      }
+      if (tipe === 'SO') {
+        return withLoading(callApi('approveBASO', {
+          soId: refDoc || logID,
+          approvedBy: confirmedBy,
+          reason: 'Konfirmasi manual BASO ' + refDoc
+        }), 'Menyetujui stock opname...');
+      }
+      toast('info', 'Aksi Tidak Dapat Dikonfirmasi', 'Tipe mutasi ' + tipe + ' belum memiliki endpoint konfirmasi khusus.');
+    });
+  }
+
+  function openStockCard(sku) {
+    App.filters.stockCard.sku = sku || '';
+    App.filters.stockCard.kategori = '';
+    App.filters.stockCard.startDate = '';
+    App.filters.stockCard.endDate = '';
+    App.filters.stockCard.tipe = '';
+    App.states.stockCard.page = 1;
+    switchInventoryTab('logs');
+    loadStockCard();
+  }
+
+  /* ====================================================================== */
+  /* LAZY LOAD PER TABEL (dipanggil saat tab diklik)                        */
+  /* ====================================================================== */
+
+  function lazyLoad(tableKey, loader, render, force) {
+    if (App.cache[tableKey] && !force) {
+      render();
+      return Promise.resolve();
+    }
+    return loader().then(function (data) {
+      App.cache[tableKey] = data.rows || [];
+      render();
+      return data;
+    }).catch(function (err) {
+      console.error('lazyLoad ' + tableKey + ' gagal:', err);
+      try {
+        toast('error', 'Gagal Memuat Data', err && err.message ? err.message : String(err));
+      } catch (toastErr) {
+        // Toast bersifat opsional.
+      }
+      return null;
+    });
+  }
+
+  /* ---------------- INBOUND ---------------- */
+
+  function loadInboundReceiving(force) {
+    return lazyLoad('inboundReceiving', function () {
+      var f = App.filters.inbound;
+      return callApi('getLazyLoadData', {
+        table: 'INBOUND_RECEIVING',
+        page: f.page,
+        limit: 500,
+        search: f.search,
+        filters: { StatusQC: f.status === 'ALL' ? '' : f.status, sortDir: 'desc' }
+      });
+    }, renderInboundReceiving, force);
+  }
+
+  function renderInboundReceiving() {
+    var rows = App.cache.inboundReceiving || [];
+    var tbody = q('#inbound-body');
+    var pager = q('#inbound-pager');
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(7, 'Tidak data penerimaan.');
+      pager.innerHTML = '';
+      return;
+    }
+    var f = App.filters.inbound;
+    var start = (f.page - 1) * 500;
+    var pageRows = rows.slice(start, start + 500);
+    tbody.innerHTML = pageRows.map(function (row) {
+      return '<tr>' +
+        '<td class="cell-strong">' + esc(row.RcvID) + '<span class="cell-sub">' + esc(row.NoSJ || '-') + '</span></td>' +
+        '<td>' + esc(row.SupplierName || row.SupplierID || '-') + '</td>' +
+        '<td>' + esc(row.LokasiID || '-') + '</td>' +
+        '<td class="cell-strong">' + esc(row.SKU) + '<span class="cell-sub">' + esc(row.NamaBarang || '-') + '</span></td>' +
+        '<td class="text-end">' + fmtNum(row.QtyBaik) + ' / <span class="qty-negative">' + fmtNum(row.QtyCacat) + '</span></td>' +
+        '<td>' + statusBadge(row.StatusQC) + '<span class="cell-sub">' + esc(shortDate(row.Timestamp)) + '</span></td>' +
+        '<td class="text-end">' +
+        '<button type="button" class="btn btn-outline-secondary btn-icon" title="Detail" data-action="inbound-detail" data-id="' + esc(row.RcvID) + '"><i class="fa-solid fa-eye"></i></button>' +
+        (normalizeKey_(row.ConfirmStatus) === 'PENDING'
+          ? '<button type="button" class="btn btn-success btn-icon" title="Konfirmasi / tolak" data-action="txn-confirm" data-module="INBOUND_RECEIVING" data-id="' + esc(row.RcvID) + '"><i class="fa-solid fa-check"></i></button>'
+          : '<span class="cell-muted">-</span>') +
+        '</td>' +
+        '</tr>';
+    }).join('');
+    renderSimplePager(pager, f.page, Math.ceil(rows.length / 500), function (p) { f.page = p; loadInboundReceiving(true); });
+  }
+
+  function loadQuarantine(force) {
+    return lazyLoad('quarantine', function () {
+      var f = App.filters.quarantine;
+      return callApi('getLazyLoadData', {
+        table: 'QUARANTINE_RETUR',
+        page: f.page,
+        limit: 500,
+        search: f.search,
+        filters: { Status: f.status === 'ALL' ? '' : f.status, sortDir: 'desc' }
+      });
+    }, renderQuarantine, force);
+  }
+
+  function renderQuarantine() {
+    var rows = App.cache.quarantine || [];
+    var tbody = q('#quarantine-body');
+    var pager = q('#quarantine-pager');
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(8, 'Tidak data karantina.');
+      pager.innerHTML = '';
+      return;
+    }
+    var f = App.filters.quarantine;
+    var start = (f.page - 1) * 500;
+    var pageRows = rows.slice(start, start + 500);
+    tbody.innerHTML = pageRows.map(function (row) {
+      return '<tr>' +
+        '<td class="cell-strong">' + esc(row.QID) + '</td>' +
+        '<td>' + esc(row.RcvID || '-') + '</td>' +
+        '<td class="cell-strong">' + esc(row.SKU) + '</td>' +
+        '<td class="text-end">' + fmtNum(row.QtyCacat) + '</td>' +
+        '<td>' + esc(row.Reason || '-') + '</td>' +
+        '<td>' + esc(row.Disposition || '-') + '</td>' +
+        '<td>' + statusBadge(row.Status) + '</td>' +
+        '<td class="text-end">' +
+        '<button type="button" class="btn btn-outline-secondary btn-icon" title="Ubah disposisi" data-action="quarantine-disposition" data-id="' + esc(row.QID) + '"><i class="fa-solid fa-pen"></i></button>' +
+        (normalizeKey_(row.ConfirmStatus) === 'PENDING'
+          ? '<button type="button" class="btn btn-success btn-icon" title="Konfirmasi / tolak" data-action="txn-confirm" data-module="QUARANTINE_RETUR" data-id="' + esc(row.QID) + '"><i class="fa-solid fa-check"></i></button>'
+          : '<span class="cell-muted">-</span>') +
+        '</td>' +
+        '</tr>';
+    }).join('');
+    renderSimplePager(pager, f.page, Math.ceil(rows.length / 500), function (p) { f.page = p; loadQuarantine(true); });
+  }
+
+  function loadClaims(force) {
+    return lazyLoad('claims', function () {
+      var f = App.filters.claims;
+      return callApi('getLazyLoadData', {
+        table: 'RETURNS_CLAIMS',
+        page: f.page,
+        limit: 500,
+        search: f.search,
+        filters: { StatusClaim: f.status === 'ALL' ? '' : f.status, sortDir: 'desc' }
+      });
+    }, renderClaims, force);
+  }
+
+  function renderClaims() {
+    var rows = App.cache.claims || [];
+    var tbody = q('#claims-body');
+    var pager = q('#claims-pager');
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(8, 'Tidak data klaim.');
+      pager.innerHTML = '';
+      return;
+    }
+    var f = App.filters.claims;
+    var start = (f.page - 1) * 500;
+    var pageRows = rows.slice(start, start + 500);
+    tbody.innerHTML = pageRows.map(function (row) {
+      return '<tr>' +
+        '<td class="cell-strong">' + esc(row.ClaimID) + '</td>' +
+        '<td>' + esc(row.OrderID || '-') + '</td>' +
+        '<td class="cell-strong">' + esc(row.SKU) + '</td>' +
+        '<td class="text-end">' + fmtNum(row.QtyReturn) + '</td>' +
+        '<td>' + esc(row.Reason || '-') + '</td>' +
+        '<td>' + esc(row.ActionDisposition || '-') + '</td>' +
+        '<td>' + statusBadge(row.StatusClaim) + '</td>' +
+        (normalizeKey_(row.ConfirmStatus) === 'PENDING'
+          ? '<button type="button" class="btn btn-success btn-icon" title="Konfirmasi / tolak" data-action="txn-confirm" data-module="RETURNS_CLAIMS" data-id="' + esc(row.ClaimID) + '" data-disposition="' + esc(normalizeKey_(row.ActionDisposition) || 'RETUR') + '"><i class="fa-solid fa-check"></i></button>'
+          : '<span class="cell-muted">-</span>') +
+        '</td>' +
+        '</tr>';
+    }).join('');
+    renderSimplePager(pager, f.page, Math.ceil(rows.length / 500), function (p) { f.page = p; loadClaims(true); });
+  }
+
+  /* ---------------- OUTBOUND ---------------- */
+
+  function loadOutboundOrders(force) {
+    return lazyLoad('outboundOrders', function () {
+      var f = App.filters.outbound;
+      return callApi('getLazyLoadData', {
+        table: 'OUTBOUND_ORDERS',
+        page: f.page,
+        limit: 500,
+        search: f.search,
+        filters: { StatusOrder: f.status === 'ALL' ? '' : f.status, sortDir: 'desc' }
+      });
+    }, renderOutboundOrders, force);
+  }
+
+  function renderOutboundOrders() {
+    var rows = App.cache.outboundOrders || [];
+    var tbody = q('#outbound-body');
+    var pager = q('#outbound-pager');
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(6, 'Tidak data order.');
+      pager.innerHTML = '';
+      return;
+    }
+    var f = App.filters.outbound;
+    var start = (f.page - 1) * 500;
+    var pageRows = rows.slice(start, start + 500);
+    tbody.innerHTML = pageRows.map(function (row) {
+      return '<tr>' +
+        '<td class="cell-strong">' + esc(row.OrderID) + '</td>' +
+        '<td>' + esc(row.NoPO || '-') + '</td>' +
+        '<td>' + esc(row.NamaOutlet || row.OutletID || '-') + '</td>' +
+        '<td class="cell-muted">' + esc(shortDate(row.TanggalOrder)) + '</td>' +
+        '<td>' + statusBadge(row.StatusOrder) + '</td>' +
+        '<td class="text-end">' +
+        '<button type="button" class="btn btn-outline-secondary btn-icon me-1" title="Detail" data-action="outbound-detail" data-id="' + esc(row.OrderID) + '"><i class="fa-solid fa-eye"></i></button>' +
+        (normalizeKey_(row.ConfirmStatus) === 'PENDING'
+          ? '<button type="button" class="btn btn-success btn-icon" title="Konfirmasi / tolak" data-action="txn-confirm" data-module="OUTBOUND_ORDERS" data-id="' + esc(row.OrderID) + '" data-nopo="' + esc(row.NoPO || '') + '"><i class="fa-solid fa-check"></i></button>'
+          : '<span class="cell-muted">-</span>') +
+        '</td>' +
+        '</tr>';
+    }).join('');
+    renderSimplePager(pager, f.page, Math.ceil(rows.length / 500), function (p) { f.page = p; loadOutboundOrders(true); });
+  }
+
+  function loadPickingList(force) {
+    return lazyLoad('pickingList', function () {
+      var f = App.filters.picking;
+      return callApi('getLazyLoadData', {
+        table: 'PICKING_LIST',
+        page: f.page,
+        limit: 500,
+        search: f.search,
+        filters: { StatusPick: f.status === 'ALL' ? '' : f.status, sortDir: 'asc' }
+      });
+    }, renderPickingList, force);
+  }
+
+  function renderPickingList() {
+    var rows = App.cache.pickingList || [];
+    var tbody = q('#picking-body');
+    var pager = q('#picking-pager');
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(7, 'Tidak data picking.');
+      pager.innerHTML = '';
+      return;
+    }
+    var f = App.filters.picking;
+    var start = (f.page - 1) * 500;
+    var pageRows = rows.slice(start, start + 500);
+    tbody.innerHTML = pageRows.map(function (row) {
+      var lokasi = row.LokasiID || row.LocationID || '-';
+      return '<tr>' +
+        '<td class="cell-strong">' + esc(row.PickID) + '</td>' +
+        '<td>' + esc(row.OrderID || '-') + '</td>' +
+        '<td class="cell-strong">' + esc(row.SKU) + '</td>' +
+        '<td>' + esc(lokasi) + '</td>' +
+        '<td class="text-end">' + fmtNum(row.QtyToPick) + '</td>' +
+        '<td>' + statusBadge(row.StatusPick) + '</td>' +
+        '<td class="text-end"></td>' +
+        '</tr>';
+    }).join('');
+    renderSimplePager(pager, f.page, Math.ceil(rows.length / 500), function (p) { f.page = p; loadPickingList(true); });
+  }
+
+  function loadDispatchManifest(force) {
+    return lazyLoad('dispatchManifest', function () {
+      var f = App.filters.manifest;
+      return callApi('getLazyLoadData', {
+        table: 'DISPATCH_MANIFEST',
+        page: f.page,
+        limit: 500,
+        search: f.search,
+        filters: { StatusShipment: f.status === 'ALL' ? '' : f.status, sortDir: 'desc' }
+      });
+    }, renderDispatchManifest, force);
+  }
+
+  function renderDispatchManifest() {
+    var rows = App.cache.dispatchManifest || [];
+    var tbody = q('#manifest-body');
+    var pager = q('#manifest-pager');
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(7, 'Tidak data manifest.');
+      pager.innerHTML = '';
+      return;
+    }
+    var f = App.filters.manifest;
+    var start = (f.page - 1) * 500;
+    var pageRows = rows.slice(start, start + 500);
+    tbody.innerHTML = pageRows.map(function (row) {
+      return '<tr>' +
+        '<td class="cell-strong">' + esc(row.ManifestID) + '</td>' +
+        '<td>' + esc(row.OrderID || '-') + '</td>' +
+        '<td>' + esc(row.Ekspedisi || '-') + '</td>' +
+        '<td>' + esc(row.NoResi_AWB || '-') + '</td>' +
+        '<td>' + esc(row.DriverName || '-') + '</td>' +
+        '<td>' + statusBadge(row.StatusShipment) + '</td>' +
+        '<td class="text-end">' +
+        '<button type="button" class="btn btn-outline-secondary btn-icon" title="Edit manifest" data-action="manifest-edit" data-id="' + esc(row.OrderID) + '"><i class="fa-solid fa-pen"></i></button>' +
+        (normalizeKey_(row.ConfirmStatus) === 'PENDING'
+          ? '<button type="button" class="btn btn-success btn-icon" title="Konfirmasi / tolak" data-action="txn-confirm" data-module="DISPATCH_MANIFEST" data-id="' + esc(row.ManifestID || row.OrderID) + '" data-status="' + esc(row.StatusShipment) + '"><i class="fa-solid fa-check"></i></button>'
+          : '<span class="cell-muted">-</span>') +
+        '</td>' +
+        '</tr>';
+    }).join('');
+    renderSimplePager(pager, f.page, Math.ceil(rows.length / 500), function (p) { f.page = p; loadDispatchManifest(true); });
+  }
+
+  function renderSimplePager(container, page, totalPages, onChange) {
+    if (!container) {
+      return;
+    }
+    container.innerHTML =
+      '<div class="pager-info">Halaman <strong>' + page + '</strong> / <strong>' + Math.max(totalPages, 1) + '</strong></div>' +
+      '<div class="pager-controls">' +
+      '<button type="button" class="btn btn-outline-secondary" data-page="prev"' + (page > 1 ? '' : ' disabled') + '><i class="fa-solid fa-chevron-left"></i></button>' +
+      '<button type="button" class="btn btn-outline-secondary" data-page="next"' + (page < totalPages ? '' : ' disabled') + '><i class="fa-solid fa-chevron-right"></i></button>' +
+      '</div>';
+    qa('button[data-page]', container).forEach(function (btn) {
+      btn.onclick = function () {
+        var dir = btn.getAttribute('data-page');
+        var np = dir === 'prev' ? page - 1 : page + 1;
+        if (np >= 1 && np <= Math.max(totalPages, 1)) {
+          onChange(np);
+        }
+      };
+    });
+  }
+
+  /* ---------------- STOCK OPNAME ---------------- */
+
+  function loadOpname(force) {
+    return lazyLoad('soHeader', function () {
+      var f = App.filters.opname;
+      return callApi('getLazyLoadData', {
+        table: 'SO_HEADER',
+        page: f.page,
+        limit: 500,
+        search: f.search,
+        filters: { Status: f.status === 'ALL' ? '' : f.status, sortDir: 'desc' }
+      });
+    }, renderOpname, force);
+  }
+
+  function renderOpname() {
+    var rows = App.cache.soHeader || [];
+    var tbody = q('#opname-body');
+    var pager = q('#opname-pager');
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(8, 'Tidak data SO.');
+      pager.innerHTML = '';
+      return;
+    }
+    var f = App.filters.opname;
+    var start = (f.page - 1) * 500;
+    var pageRows = rows.slice(start, start + 500);
+    tbody.innerHTML = pageRows.map(function (row) {
+      var progress = Number(row.Progress) || 0;
+      var variance = Number(row.TotalVariance) || 0;
+      var vtone = variance < 0 ? 'qty-negative' : variance > 0 ? 'qty-positive' : 'qty-zero';
+      var actions = '';
+      if (row.Status === 'IN_PROGRESS' || row.Status === 'COUNTED') {
+        actions += '<button type="button" class="btn btn-outline-secondary btn-icon me-1" title="Blind count" data-action="opname-count" data-id="' + esc(row.SO_ID) + '"><i class="fa-solid fa-pen-to-square"></i></button>';
+      }
+      if (can('approval') && (row.Status === 'COUNTED' || row.Status === 'IN_PROGRESS')) {
+        actions += '<button type="button" class="btn btn-outline-secondary btn-icon" title="Variance / approve" data-action="opname-variance" data-id="' + esc(row.SO_ID) + '"><i class="fa-solid fa-scale-balanced"></i></button>';
+        if (normalizeKey_(row.ConfirmStatus) === 'PENDING') {
+          actions += '<button type="button" class="btn btn-success btn-icon" title="Konfirmasi BASO" data-action="txn-confirm" data-module="STOCK_OPNAME" data-id="' + esc(row.SO_ID) + '"><i class="fa-solid fa-check"></i></button>';
+        }
+      }
+      return '<tr>' +
+        '<td class="cell-strong">' + esc(row.SO_ID) + '</td>' +
+        '<td class="cell-muted">' + esc(shortDate(row.TanggalSO)) + '</td>' +
+        '<td>' + esc(row.Cakupan || '-') + '</td>' +
+        '<td class="text-end">' + fmtNum(row.TotalSKU || row.TotalLines) + '</td>' +
+        '<td class="text-end">' + progress + '%<span class="cell-sub">' + fmtNum(row.CountedLines) + ' dihitung</span></td>' +
+        '<td class="text-end"><span class="' + vtone + '">' + (variance ? qtyCell(variance) : '<span class="qty-zero">0</span>') + '</span></td>' +
+        '<td>' + statusBadge(row.Status) + '</td>' +
+        '<td class="text-end">' + actions + '</td>' +
+        '</tr>';
+    }).join('');
+    renderSimplePager(pager, f.page, Math.ceil(rows.length / 500), function (p) { f.page = p; loadOpname(true); });
+  }
+
+  /* ---------------- MASTER DATA ---------------- */
+
+  var MASTER_TABLE = {
+    items: {
+      label: 'Barang',
+      head: ['SKU', 'Nama Barang', 'Kategori', 'Zone', 'Rak Default', 'Min', 'Max', 'Satuan', 'Status', 'Aksi'],
+      row: function (row) {
+        return '<tr>' +
+          '<td class="cell-strong">' + esc(row.SKU) + '</td>' +
+          '<td>' + esc(row.NamaBarang) + '<span class="cell-sub">' + esc(row.Kategori) + '</span></td>' +
+          '<td>' + esc(row.Kategori) + '</td>' +
+          '<td>' + statusBadge(row.Zone) + '</td>' +
+          '<td>' + esc(row.RakDefault || '-') + '</td>' +
+          '<td class="text-end">' + fmtNum(row.MinStock) + '</td>' +
+          '<td class="text-end">' + fmtNum(row.MaxStock) + '</td>' +
+          '<td>' + esc(row.Satuan) + '</td>' +
+          '<td>' + statusBadge(row.Status) + '</td>' +
+          '<td class="text-end">' + editButton('items', row.SKU) + '</td>' +
+          '</tr>';
+      }
+    },
+    locations: {
+      label: 'Lokasi',
+      head: ['Lokasi ID', 'Area', 'Zone', 'Aisle', 'Bin', 'Capacity', 'Current Qty', 'Status', 'Aksi'],
+      row: function (row) {
+        var lokasiID = row.LokasiID || row.LocationID || '';
+        return '<tr>' +
+          '<td class="cell-strong">' + esc(lokasiID) + '</td>' +
+          '<td>' + esc(row.Area || '-') + '</td>' +
+          '<td>' + statusBadge(row.Zone) + '</td>' +
+          '<td>' + esc(row.Aisle || '-') + '</td>' +
+          '<td>' + esc(row.Bin || '-') + '</td>' +
+          '<td class="text-end">' + fmtNum(row.Capacity) + '</td>' +
+          '<td class="text-end">' + fmtNum(row.CurrentQty) + '</td>' +
+          '<td>' + statusBadge(row.Status) + '</td>' +
+          '<td class="text-end">' + editButton('locations', lokasiID) + '</td>' +
+          '</tr>';
+      }
+    },
+    suppliers: {
+      label: 'Supplier',
+      head: ['Supplier ID', 'Nama Supplier', 'Kontak', 'Alamat', 'Aksi'],
+      row: function (row) {
+        return '<tr>' +
+          '<td class="cell-strong">' + esc(row.SupplierID) + '</td>' +
+          '<td>' + esc(row.NamaSupplier) + '</td>' +
+          '<td>' + esc(row.Kontak || '-') + '</td>' +
+          '<td>' + esc(row.Alamat || '-') + '</td>' +
+          '<td class="text-end">' + editButton('suppliers', row.SupplierID) + '</td>' +
+          '</tr>';
+      }
+    },
+    outlets: {
+      label: 'Outlet',
+      head: ['Outlet ID', 'Nama Outlet', 'Alamat', 'Kontak', 'Aksi'],
+      row: function (row) {
+        return '<tr>' +
+          '<td class="cell-strong">' + esc(row.OutletID) + '</td>' +
+          '<td>' + esc(row.NamaOutlet) + '</td>' +
+          '<td>' + esc(row.Alamat || '-') + '</td>' +
+          '<td>' + esc(row.Kontak || '-') + '</td>' +
+          '<td class="text-end">' + editButton('outlets', row.OutletID) + '</td>' +
+          '</tr>';
+      }
+    },
+    users: {
+      label: 'User',
+      head: ['User', 'Username', 'Role', 'Status', 'User ID', 'Aksi'],
+      row: function (row) {
+        var roleTone = row.Role === 'ADMIN' ? 'tone-navy' : 'tone-muted';
+        var isCurrent = App.user && String(App.user.UserID) === String(row.UserID);
+        var statusAction = row.Status === 'ACTIVE' ? 'Nonaktifkan' : 'Aktifkan';
+        return '<tr>' +
+          '<td><div class="user-cell"><span class="user-avatar-sm">' + esc(initials(row.NamaLengkap || row.Username)) + '</span>' +
+          '<span><strong>' + esc(row.NamaLengkap || '-') + '</strong><small>' + (isCurrent ? 'Akun Anda' : 'Akun WMS') + '</small></span></div></td>' +
+          '<td class="cell-strong">' + esc(row.Username) + '</td>' +
+          '<td><span class="status-badge ' + roleTone + '">' + esc(row.Role) + '</span></td>' +
+          '<td>' + statusBadge(row.Status) + '</td>' +
+          '<td class="cell-muted">' + esc(row.UserID) + '</td>' +
+          '<td class="text-end">' +
+          '<button type="button" class="btn btn-outline-secondary btn-icon me-1" title="Edit user" data-action="edit-user" data-id="' + esc(row.UserID) + '"><i class="fa-solid fa-pen"></i></button>' +
+          '<button type="button" class="btn btn-outline-secondary btn-icon me-1" title="Reset password" data-action="reset-user-password" data-id="' + esc(row.UserID) + '"><i class="fa-solid fa-key"></i></button>' +
+          '<button type="button" class="btn btn-outline-secondary btn-icon" title="' + statusAction + '" data-action="toggle-user-status" data-id="' + esc(row.UserID) + '" data-status="' + esc(row.Status) + '"><i class="fa-solid fa-' + (row.Status === 'ACTIVE' ? 'user-slash' : 'user-check') + '"></i></button>' +
+          '</td>' +
+          '</tr>';
+      }
+    },
+    sync: {
+      label: 'Sync Logs',
+      head: ['Sync ID', 'Waktu', 'Trigger', 'Inbound', 'Outbound', 'Log Baru', 'SKU', 'Status', 'Durasi', 'Aksi'],
+      row: function (row) {
+        return '<tr>' +
+          '<td class="cell-strong">' + esc(row.SyncID) + '</td>' +
+          '<td class="cell-muted">' + esc(shortDate(row.Timestamp)) + '</td>' +
+          '<td>' + statusBadge(row.TriggeredBy) + '</td>' +
+          '<td class="text-end">' + fmtNum(row.InboundScanned) + '</td>' +
+          '<td class="text-end">' + fmtNum(row.OutboundScanned) + '</td>' +
+          '<td class="text-end"><strong>' + fmtNum(row.LogsCreated) + '</strong></td>' +
+          '<td class="text-end">' + fmtNum(row.SkuRecalculated) + '</td>' +
+          '<td>' + statusBadge(row.Status) + '</td>' +
+          '<td class="text-end cell-muted">' + fmtNum(row.DurationMs) + ' ms</td>' +
+          '<td class="text-end"></td>' +
+          '</tr>';
+      }
+    }
+  };
+
+  function editButton(type, id) {
+    return '<button type="button" class="btn btn-outline-secondary btn-icon" title="Edit" ' +
+      'data-action="edit-master" data-type="' + esc(type) + '" data-id="' + esc(id) + '">' +
+      '<i class="fa-solid fa-pen"></i></button>';
+  }
+
+  function loadMaster(force) {
+    var type = App.masterType;
+    var cacheKey = masterCacheKey(type);
+    return lazyLoad(cacheKey, function () {
+      var f = App.filters.master;
+      if (type === 'users') {
+        return callApi('getUsers', { search: f.search || '' }).then(function (result) {
+          return { rows: result.users || [] };
+        });
+      }
+      if (type === 'sync') {
+        return callApi('getSyncHistory', { page: 1, limit: 100, search: f.search || '' }).then(function (result) {
+          return { rows: result.rows || [] };
+        });
+      }
+      return callApi('getLazyLoadData', {
+        table: 'MASTER_' + type.toUpperCase(),
+        page: f.page,
+        limit: 100,
+        search: f.search,
+        filters: { sortDir: 'asc' }
+      });
+    }, renderMaster, force);
+  }
+
+  function masterCacheKey(type) {
+    if (type === 'users') {
+      return 'masterUsers';
+    }
+    if (type === 'sync') {
+      return 'syncHistory';
+    }
+    return 'master' + type;
+  }
+
+  function renderMaster() {
+    var key = App.masterType;
+    var rows = App.cache[masterCacheKey(key)] || [];
+    var tbody = q('#master-body');
+    var thead = q('#master-table-head');
+    var pager = q('#master-pager');
+    var config = MASTER_TABLE[key];
+    if (!config || !tbody || !thead) {
+      return;
+    }
+    if (pager) {
+      pager.innerHTML = '';
+    }
+    thead.innerHTML = '<tr>' + config.head.map(function (h, i) {
+      return '<th' + (i === config.head.length - 1 ? ' class="text-end"' : '') + '>' + esc(h) + '</th>';
+    }).join('') + '</tr>';
+
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(config.head.length, 'Tidak ada data.');
+      return;
+    }
+    var f = App.filters.master;
+    var start = (f.page - 1) * 100;
+    var pageRows = rows.slice(start, start + 100);
+    tbody.innerHTML = pageRows.map(config.row).join('');
+    if (pager) {
+      renderSimplePager(pager, f.page, Math.ceil(rows.length / 100), function (p) { f.page = p; loadMaster(true); });
+    }
+    App.masterRows[key] = {};
+    rows.forEach(function (row) {
+      var id = row.SKU || row.LokasiID || row.LocationID || row.SupplierID || row.OutletID || row.UserID || row.SyncID;
+      if (id) {
+        App.masterRows[key][String(id).toUpperCase()] = row;
+      }
+    });
+  }
+
+  /* ---------------- SYNC ---------------- */
+
+  function loadSync(force) {
+    return lazyLoad('syncHistory', function () {
+      return callApi('getSyncHistory', { page: 1, limit: 50, search: '' });
+    }, renderSync, force);
+  }
+
+  function renderSync() {
+    var rows = App.cache.syncHistory || [];
+    var tbody = q('#sync-history-body');
+    var pager = q('#sync-history-pager');
+    if (!tbody) {
+      return;
+    }
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(9, 'Belum ada riwayat sinkronisasi.');
+      if (pager) {
+        pager.innerHTML = '';
+      }
+      return;
+    }
+    tbody.innerHTML = rows.map(function (row) {
+      return '<tr>' +
+        '<td class="cell-muted">' + esc(shortDate(row.Timestamp)) + '</td>' +
+        '<td>' + statusBadge(row.TriggeredBy) + '</td>' +
+        '<td class="text-end">' + fmtNum(row.InboundScanned) + '</td>' +
+        '<td class="text-end">' + fmtNum(row.OutboundScanned) + '</td>' +
+        '<td class="text-end"><strong>' + fmtNum(row.LogsCreated) + '</strong></td>' +
+        '<td class="text-end">' + fmtNum(row.SkuRecalculated) + '</td>' +
+        '<td>' + statusBadge(row.Status) + '</td>' +
+        '<td class="text-end cell-muted">' + fmtNum(row.DurationMs) + ' ms</td>' +
+        '<td class="text-end"></td>' +
+        '</tr>';
+    }).join('');
+    if (pager) {
+      renderSimplePager(pager, 1, Math.ceil(rows.length / 50), function (p) { loadSync(true); });
+    }
+  }
+
+  /* ====================================================================== */
+  /* SLIDE-OVER DRAWER                                                      */
+  /* ====================================================================== */
+
+  function openDrawer(title, bodyHtml, footerHtml, size) {
+    var root = q('#modal-root');
+    if (!root) {
+      console.error('openDrawer: #modal-root tidak ditemukan di DOM.');
+      return null;
+    }
+    var id = 'app-drawer-modal';
+    root.innerHTML =
+      '<div class="modal fade" id="' + id + '" tabindex="-1" aria-hidden="true">' +
+      '<div class="modal-dialog modal-dialog-centered ' + esc(size || 'modal-lg') + '">' +
+      '<div class="modal-content">' +
+      '<div class="modal-header"><h5 class="modal-title">' + esc(title || '') + '</h5>' +
+      '<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Tutup"></button></div>' +
+      '<div class="modal-body" style="max-height:75vh; overflow-y:auto;">' + (bodyHtml || '') + '</div>' +
+      '<div class="modal-footer">' + (footerHtml || '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Tutup</button>') + '</div>' +
+      '</div></div></div>';
+
+    var element = q('#' + id);
+    if (!element) {
+      console.error('openDrawer: gagal membuat elemen modal.');
+      return null;
+    }
+    var modal = new bootstrap.Modal(element, { backdrop: 'static', keyboard: true });
+    safeBind(element, 'hidden.bs.modal', function () {
+      root.innerHTML = '';
+    });
+    modal.show();
+    return { el: element, modal: modal };
+  }
+
+  function openOutboundDetail(orderID) {
+    withLoading(callApi('getOutboundOrderDetail', { orderID: orderID }), 'Memuat detail order...')
+      .then(function (detail) {
+        var order = detail.order || {};
+        var rows = detail.details || [];
+        var manifest = detail.manifest || [];
+        var body =
+          '<div class="row g-2 mb-3">' +
+          '<div class="col-4"><div class="border rounded-3 p-2 text-center"><small class="text-muted d-block">Order ID</small><strong>' + esc(order.OrderID) + '</strong></div></div>' +
+          '<div class="col-4"><div class="border rounded-3 p-2 text-center"><small class="text-muted d-block">No PO</small><strong>' + esc(order.NoPO) + '</strong></div></div>' +
+          '<div class="col-4"><div class="border rounded-3 p-2 text-center"><small class="text-muted d-block">Outlet</small><strong>' + esc(order.NamaOutlet || order.OutletID || '-') + '</strong></div></div>' +
+          '<div class="col-4"><div class="border rounded-3 p-2 text-center"><small class="text-muted d-block">Tanggal</small><strong>' + esc(shortDate(order.TanggalOrder)) + '</strong></div></div>' +
+          '<div class="col-4"><div class="border rounded-3 p-2 text-center"><small class="text-muted d-block">Status</small>' + statusBadge(order.StatusOrder) + '</div></div>' +
+          '<div class="col-4"><div class="border rounded-3 p-2 text-center"><small class="text-muted d-block">Created By</small><strong>' + esc(order.CreatedBy || '-') + '</strong></div></div>' +
+          '</div>' +
+          '<div class="section-label"><span>Detail Barang (' + rows.length + ' baris)</span></div>' +
+          '<div class="table-responsive"><table class="table modal-table align-middle"><thead><tr><th>SKU</th><th>Barang</th><th class="text-end">Order</th><th class="text-end">Picked</th><th class="text-end">Checked</th><th class="text-end">Packed</th><th class="text-end">Lokasi</th></tr></thead><tbody>' +
+          (rows.length ? rows.map(function (row) {
+            return '<tr><td class="cell-strong">' + esc(row.SKU) + '</td><td>' + esc(row.NamaBarang) + '</td>' +
+              '<td class="text-end">' + fmtNum(row.QtyOrdered) + '</td>' +
+              '<td class="text-end">' + fmtNum(row.QtyPicked) + '</td>' +
+              '<td class="text-end">' + fmtNum(row.QtyChecked) + '</td>' +
+              '<td class="text-end">' + fmtNum(row.QtyPacked) + '</td>' +
+              '<td>' + esc(row.LokasiID || '-') + '</td></tr>';
+          }).join('') : emptyRow(7, 'Tidak ada detail.')) +
+          '</tbody></table></div>' +
+          (manifest.length ? (
+            '<div class="section-label mt-3"><span>Manifest (' + manifest.length + ')</span></div>' +
+            '<div class="table-responsive"><table class="table modal-table align-middle"><thead><tr><th>Manifest</th><th>Ekspedisi</th><th>No Resi</th><th>Driver</th><th>Status</th><th>Waktu</th></tr></thead><tbody>' +
+            manifest.map(function (row) {
+              return '<tr><td class="cell-strong">' + esc(row.ManifestID) + '</td><td>' + esc(row.Ekspedisi || '-') + '</td>' +
+                '<td>' + esc(row.NoResi_AWB || '-') + '</td><td>' + esc(row.DriverName || '-') + '</td>' +
+                '<td>' + statusBadge(row.StatusShipment) + '</td><td class="cell-muted">' + esc(shortDate(row.Timestamp)) + '</td></tr>';
+            }).join('') +
+            '</tbody></table></div>'
+          ) : '') +
+          '<div class="section-label mt-3"><span>Ubah Manifest</span></div>' +
+          '<form id="manifest-form">' +
+          '<div class="row g-2">' +
+          '<div class="col-md-3"><label class="form-label">Ekspedisi</label><input type="text" class="form-control" name="ekspedisi" value="' + esc((manifest[0] && manifest[0].Ekspedisi) || '') + '"></div>' +
+          '<div class="col-md-3"><label class="form-label">No Resi / AWB</label><input type="text" class="form-control" name="noResi" value="' + esc((manifest[0] && manifest[0].NoResi_AWB) || '') + '"></div>' +
+          '<div class="col-md-3"><label class="form-label">Driver</label><input type="text" class="form-control" name="driverName" value="' + esc((manifest[0] && manifest[0].DriverName) || '') + '"></div>' +
+          '<div class="col-md-3"><label class="form-label">Status</label><select class="form-select" name="statusShipment">' +
+          '<option value="SHIPPED"' + ((manifest[0] && normalizeKey_(manifest[0].StatusShipment) === 'SHIPPED') ? ' selected' : '') + '>SHIPPED</option>' +
+          '<option value="DELIVERED"' + ((manifest[0] && normalizeKey_(manifest[0].StatusShipment) === 'DELIVERED') ? ' selected' : '') + '>DELIVERED</option>' +
+          '</select></div>' +
+          '</div>' +
+          '</form>';
+
+        openDrawer('Detail Order ' + esc(orderID), body,
+          '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Tutup</button>' +
+          (manifest.length ? '<button type="submit" form="manifest-form" class="btn btn-primary"><i class="fa-solid fa-floppy-disk"></i> Simpan Manifest</button>' : '') +
+          (can('inbound') ? '<button type="button" class="btn btn-outline-primary ms-2" data-action="outbound-status" data-id="' + esc(orderID) + '" data-status="' + esc(order.StatusOrder) + '"><i class="fa-solid fa-arrow-right-arrow-left"></i> Update Status</button>' : ''),
+          'modal-xl');
+
+        safeBind(q('#manifest-form', q('#app-drawer-modal')), 'submit', function (event) {
+          event.preventDefault();
+          var form = event.target;
+          var payload = {
+            orderId: orderID,
+            ekspedisi: form.elements.ekspedisi.value,
+            noResi: form.elements.noResi.value,
+            driverName: form.elements.driverName.value,
+            statusShipment: form.elements.statusShipment.value
+          };
+          withLoading(callApi('updateManifest', payload), 'Menyimpan manifest...')
+            .then(function (result) {
+              toast('success', 'Manifest tersimpan', 'Order ' + orderID + ' diperbarui.');
+              var _closeBtn = q('#app-drawer-modal .modal .btn-close'); if (_closeBtn) { _closeBtn.click(); }
+              App.cache.dispatchManifest = null;
+              loadDispatchManifest(true);
+            })
+            .catch(function (err) { showError(err, 'Manifest Gagal'); });
+        });
+      })
+      .catch(function (err) { showError(err, 'Gagal Memuat Detail'); });
+  }
+
+  /* ====================================================================== */
+  /* ADJUSTMENT / TRANSFER                                                  */
+  /* ====================================================================== */
+
+  function openAdjustmentModal(prefill) {
+    prefill = prefill || {};
+    loadOptions().then(function () {
+      var body =
+        '<form id="adjustment-form">' +
+        '<div class="row g-2">' +
+        '<div class="col-md-6"><label class="form-label">SKU</label><select class="form-select" name="sku" required>' + itemOptions(prefill.sku) + '</select></div>' +
+        '<div class="col-md-6"><label class="form-label">Lokasi</label><select class="form-select" name="locationID" required>' + locationOptions(prefill.location) + '</select></div>' +
+        '<div class="col-md-6"><label class="form-label">Qty Adjustment</label><input type="number" class="form-control" name="qty" placeholder="Contoh: 5 atau -3" required><div class="form-text">Gunakan nilai positif untuk menambah dan negatif untuk mengurangi.</div></div>' +
+        '<div class="col-md-6"><label class="form-label">Referensi</label><input type="text" class="form-control" name="refDoc" placeholder="Opsional"></div>' +
+        '<div class="col-12"><label class="form-label">Alasan Adjustment</label><textarea class="form-control" name="reason" rows="2" required placeholder="Contoh: koreksi hasil hitung fisik"></textarea></div>' +
+        '</div>' +
+        '</form>';
+
+      openDrawer('Stock Adjustment', body,
+        '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>' +
+        '<button type="submit" form="adjustment-form" class="btn btn-primary"><i class="fa-solid fa-floppy-disk"></i> Simpan</button>',
+        'modal-lg');
+
+        safeBind(q('#adjustment-form', q('#app-drawer-modal')), 'submit', function (event) {
+        event.preventDefault();
+        var form = event.target;
+        var payload = {
+          sku: form.elements.sku.value,
+          locationID: form.elements.locationID.value,
+          qty: form.elements.qty.value,
+          refDoc: form.elements.refDoc.value,
+          reason: form.elements.reason.value,
+          user: App.user ? (App.user.NamaLengkap || App.user.Username) : ''
+        };
+        withLoading(callApi('processStockAdjustment', payload), 'Menyimpan adjustment...')
+          .then(function (result) {
+            var _closeBtn = q('#app-drawer-modal .modal .btn-close'); if (_closeBtn) { _closeBtn.click(); }
+            toast('success', 'Adjustment tersimpan', 'Saldo akhir ' + fmtNum(result.saldoAkhir) + ' untuk SKU ' + result.sku + '.');
+            App.cache.stockLogs = null;
+            App.cache.inboundReceiving = null;
+            App.loaded.stockMonitor = false;
+            App.loaded.stockCard = false;
+            if (App.activeView === 'inventory') {
+              if (App.invTab === 'logs') {
+                loadStockCard();
+              } else {
+                loadStockMonitoring(true);
+              }
+            }
+            loadInitialAppData().catch(function () {});
+          })
+          .catch(function (err) { showError(err, 'Adjustment Gagal'); });
+      });
+    }).catch(function (err) { showError(err, 'Gagal Memuat Opsi'); });
+  }
+
+  function openTransferModal(prefill) {
+    prefill = prefill || {};
+    loadOptions().then(function () {
+      var body =
+        '<form id="transfer-form">' +
+        '<div class="row g-2">' +
+        '<div class="col-12"><label class="form-label">SKU</label><select class="form-select" name="sku" required>' + itemOptions(prefill.sku) + '</select></div>' +
+        '<div class="col-md-6"><label class="form-label">Lokasi Asal</label><select class="form-select" name="fromLocationID" required>' + locationOptions(prefill.location, 'Pilih lokasi asal...') + '</select></div>' +
+        '<div class="col-md-6"><label class="form-label">Lokasi Tujuan</label><select class="form-select" name="toLocationID" required>' + locationOptions('', 'Pilih lokasi tujuan...') + '</select></div>' +
+        '<div class="col-md-6"><label class="form-label">Qty Transfer</label><input type="number" min="1" class="form-control" name="qty" required></div>' +
+        '<div class="col-md-6"><label class="form-label">Referensi</label><input type="text" class="form-control" name="refDoc" placeholder="Opsional"></div>' +
+        '</div>' +
+        '</form>';
+
+      openDrawer('Transfer Stok Antar Bin', body,
+        '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>' +
+        '<button type="submit" form="transfer-form" class="btn btn-primary"><i class="fa-solid fa-right-left"></i> Transfer</button>',
+        'modal-lg');
+
+      safeBind(q('#transfer-form', q('#app-drawer-modal')), 'submit', function (event) {
+        event.preventDefault();
+        var form = event.target;
+        var payload = {
+          sku: form.elements.sku.value,
+          fromLocationID: form.elements.fromLocationID.value,
+          toLocationID: form.elements.toLocationID.value,
+          qty: form.elements.qty.value,
+          refDoc: form.elements.refDoc.value,
+          user: App.user ? (App.user.NamaLengkap || App.user.Username) : ''
+        };
+        withLoading(callApi('processStockTransfer', payload), 'Memproses transfer...')
+          .then(function (result) {
+            var _closeBtn = q('#app-drawer-modal .modal .btn-close'); if (_closeBtn) { _closeBtn.click(); }
+            toast('success', 'Transfer berhasil', fmtNum(result.qty) + ' unit dipindahkan.');
+            App.cache.stockLogs = null;
+            App.loaded.stockMonitor = false;
+            App.loaded.stockCard = false;
+            if (App.activeView === 'inventory') {
+              if (App.invTab === 'logs') {
+                loadStockCard();
+              } else {
+                loadStockMonitoring(true);
+              }
+            }
+            loadInitialAppData().catch(function () {});
+          })
+          .catch(function (err) { showError(err, 'Transfer Gagal'); });
+      });
+    }).catch(function (err) { showError(err, 'Gagal Memuat Opsi'); });
+  }
+
+  /* ====================================================================== */
+  /* STOCK OPNAME ACTIONS                                                   */
+  /* ====================================================================== */
+
+  function openBlindCount(soID) {
+    withLoading(callApi('getSOForCounting', { soID: soID }), 'Memuat lembar hitung...')
+      .then(function (data) {
+        var rows = data.lines || [];
+        var body =
+          '<form id="blind-count-form">' +
+          '<div class="alert alert-light border mb-3"><strong>' + esc(data.soID) + '</strong> &middot; ' + esc(data.tanggalSO) + '<br><span class="text-muted small">Masukkan hasil hitung fisik.</span></div>' +
+          '<div class="table-responsive"><table class="table modal-table align-middle"><thead><tr><th>SKU</th><th>Barang</th><th>Lokasi</th><th class="text-end">Qty Hitung</th></tr></thead><tbody>' +
+          (rows.length ? rows.map(function (row) {
+            return '<tr>' +
+              '<td class="cell-strong">' + esc(row.SKU) + '</td>' +
+              '<td>' + esc(row.NamaBarang) + '<span class="cell-sub">' + esc(row.Satuan || '') + '</span></td>' +
+              '<td>' + esc(row.LokasiID || '-') + '</td>' +
+              '<td class="text-end"><input type="number" min="0" class="form-control form-control-sm so-count text-end" data-sku="' + esc(row.SKU) + '" data-location="' + esc(row.LokasiID || '') + '" value="' + (row.CountQty === '' || row.CountQty === null ? '' : esc(row.CountQty)) + '" required style="max-width:130px;margin-left:auto"></td>' +
+              '</tr>';
+          }).join('') : emptyRow(4, 'Tidak ada baris SO.')) +
+          '</tbody></table></div>' +
+          '</form>';
+
+        openDrawer('Blind Count ' + esc(soID), body,
+          '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>' +
+          '<button type="submit" form="blind-count-form" class="btn btn-primary"><i class="fa-solid fa-floppy-disk"></i> Simpan Hitung</button>',
+          'modal-lg');
+
+        safeBind(q('#blind-count-form', q('#app-drawer-modal')), 'submit', function (event) {
+          event.preventDefault();
+          var counts = qa('.so-count', q('#app-drawer-modal')).map(function (input) {
+            return {
+              sku: input.getAttribute('data-sku'),
+              locationID: input.getAttribute('data-location'),
+              countQty: input.value
+            };
+          });
+          if (counts.some(function (item) { return item.countQty === ''; })) {
+            showError(new Error('Semua baris harus diisi hasil hitungnya.'), 'Blind Count');
+            return;
+          }
+          withLoading(callApi('submitBlindCount', { soID: soID, counts: counts }), 'Menyimpan hasil hitung...')
+            .then(function (result) {
+              var _closeBtn = q('#app-drawer-modal .modal .btn-close'); if (_closeBtn) { _closeBtn.click(); }
+              toast('success', 'Hitung tersimpan', 'Total variance ' + fmtNum(result.totalVariance) + '.');
+              App.cache.soHeader = null;
+              App.cache.soDetail = null;
+              App.loaded.opname = false;
+              loadOpname(true);
+              loadInitialAppData().catch(function () {});
+            })
+            .catch(function (err) { showError(err, 'Blind Count Gagal'); });
+        });
+      })
+      .catch(function (err) { showError(err, 'Gagal Memuat Blind Count'); });
+  }
+
+  function openVariance(soID) {
+    withLoading(callApi('getSOVarianceData', { soID: soID }), 'Memuat variance...')
+      .then(function (data) {
+        var summary = data.summary || {};
+        var rows = data.lines || [];
+        var approved = String(data.statusApproval).toUpperCase() === 'APPROVED';
+        var body =
+          '<div class="row g-2 mb-3">' +
+          '<div class="col-4"><div class="border rounded-3 p-2 text-center"><small class="text-muted d-block">Total System</small><strong>' + fmtNum(summary.totalSystemQty) + '</strong></div></div>' +
+          '<div class="col-4"><div class="border rounded-3 p-2 text-center"><small class="text-muted d-block">Total Count</small><strong>' + fmtNum(summary.totalCountQty) + '</strong></div></div>' +
+          '<div class="col-4"><div class="border rounded-3 p-2 text-center"><small class="text-muted d-block">Total Variance</small><strong class="' + (summary.totalVariance < 0 ? 'text-danger' : 'text-success') + '">' + qtyCell(summary.totalVariance) + '</strong></div></div>' +
+          '</div>' +
+          '<div class="table-responsive"><table class="table modal-table align-middle"><thead><tr><th>SKU</th><th>Barang</th><th>Lokasi</th><th class="text-end">System</th><th class="text-end">Count</th><th class="text-end">Variance</th><th>Status</th></tr></thead><tbody>' +
+          (rows.length ? rows.map(function (row) {
+            return '<tr>' +
+              '<td class="cell-strong">' + esc(row.SKU) + '</td>' +
+              '<td>' + esc(row.NamaBarang) + '</td>' +
+              '<td>' + esc(row.LokasiID || '-') + '</td>' +
+              '<td class="text-end">' + fmtNum(row.SystemQty) + '</td>' +
+              '<td class="text-end">' + (row.Counted ? fmtNum(row.CountQty) : '-') + '</td>' +
+              '<td class="text-end">' + (row.Counted ? qtyCell(row.Variance) : '-') + '</td>' +
+              '<td>' + statusBadge(row.StatusApproval) + '</td>' +
+              '</tr>';
+          }).join('') : emptyRow(7, 'Tidak ada baris.')) +
+          '</tbody></table></div>';
+
+        var footer = '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Tutup</button>';
+        if (!approved && can('approval')) {
+          footer += '<button type="button" class="btn btn-primary" id="btn-approve-baso"><i class="fa-solid fa-check-double"></i> Approve BASO</button>';
+        }
+
+        openDrawer('Variance & Approval BASO', body, footer, 'modal-xl');
+
+        var approveBtn = q('#btn-approve-baso', q('#app-drawer-modal'));
+        if (approveBtn) {
+          safeBind(approveBtn, 'click', function () {
+            Swal.fire({
+              title: 'Approve BASO?',
+              text: 'Stok akan otomatis disesuaikan ke qty hasil hitung.',
+              input: 'textarea',
+              inputLabel: 'Alasan adjustment (opsional)',
+              inputPlaceholder: 'Contoh: selisih hitung fisik',
+              icon: 'question',
+              showCancelButton: true,
+              confirmButtonText: 'Ya, Approve',
+              cancelButtonText: 'Batal'
+            }).then(function (answer) {
+              if (!answer.isConfirmed) {
+                return;
+              }
+              withLoading(callApi('approveBASO', {
+                soID: soID,
+                approvedBy: App.user ? (App.user.NamaLengkap || App.user.Username) : App.userEmail,
+                reason: answer.value || ''
+              }), 'Approving BASO...')
+                .then(function (result) {
+                  var _closeBtn = q('#app-drawer-modal .modal .btn-close'); if (_closeBtn) { _closeBtn.click(); }
+                  toast('success', 'BASO disetujui', result.adjustmentLines + ' baris disesuaikan.');
+                  App.cache.stockLogs = null;
+                  App.cache.soHeader = null;
+                  App.cache.soDetail = null;
+                  App.loaded.stockMonitor = false;
+                  App.loaded.stockCard = false;
+                  App.loaded.opname = false;
+                  if (App.activeView === 'approval') {
+                    loadApproval(true);
+                  } else {
+                    loadOpname(true);
+                  }
+                  loadInitialAppData().catch(function () {});
+                })
+                .catch(function (err) { showError(err, 'Approve BASO Gagal'); });
+            });
+          });
+        }
+      })
+      .catch(function (err) { showError(err, 'Gagal Memuat Variance'); });
+  }
+
+  function loadApproval(force) {
+    return lazyLoad('soHeader', function () {
+      var f = App.filters.opname;
+      return callApi('getLazyLoadData', {
+        table: 'SO_HEADER',
+        page: f.page,
+        limit: 100,
+        search: f.search,
+        filters: { Status: ['IN_PROGRESS', 'COUNTED'], sortDir: 'desc' }
+      });
+    }, renderApproval, force);
+  }
+
+  function renderApproval() {
+    var rows = (App.cache.soHeader || []).filter(function (row) {
+      var st = normalizeKey_(row.Status);
+      return st === 'IN_PROGRESS' || st === 'COUNTED';
+    });
+    var tbody = q('#approval-body');
+    var pager = q('#approval-pager');
+    setText('#approval-count', fmtNum(rows.length));
+    if (!rows.length) {
+      tbody.innerHTML = emptyRow(8, 'Tidak ada dokumen yang menunggu approval.');
+      pager.innerHTML = '';
+      return;
+    }
+    var f = App.filters.approval || { search: '', status: 'ALL', page: 1 };
+    var start = (f.page - 1) * 100;
+    var pageRows = rows.slice(start, start + 100);
+    tbody.innerHTML = pageRows.map(function (row) {
+      var progress = Number(row.Progress) || 0;
+      var countedLines = Number(row.CountedLines) || 0;
+      return '<tr>' +
+        '<td class="cell-strong">' + esc(row.SO_ID) + '</td>' +
+        '<td class="cell-muted">' + esc(shortDate(row.TanggalSO)) + '</td>' +
+        '<td>' + esc(row.Cakupan || '-') + '</td>' +
+        '<td class="text-end">' + fmtNum(row.TotalSKU || row.TotalLines) + '</td>' +
+        '<td class="text-end">' + progress + '%<span class="cell-sub">' + fmtNum(countedLines) + ' dihitung</span></td>' +
+        '<td class="text-end">' + (countedLines ? qtyCell(row.TotalVariance) : '-') + '</td>' +
+        '<td>' + statusBadge(row.Status) + '</td>' +
+        '<td class="text-end">' +
+        '<button type="button" class="btn btn-outline-secondary btn-icon" title="Review & approve" data-action="opname-variance" data-id="' + esc(row.SO_ID) + '"><i class="fa-solid fa-check-double"></i></button>' +
+        '</td>' +
+        '</tr>';
+    }).join('');
+    renderSimplePager(pager, f.page, Math.ceil(rows.length / 100), function (p) { f.page = p; loadApproval(true); });
+  }
+
+  /* ====================================================================== */
+  /* USERS                                                                  */
+  /* ====================================================================== */
+
+  function loadUsers(force) {
+    return lazyLoad('masterUsers', function () {
+      return callApi('getUsers', { search: App.filters.master.search || '' }).then(function (result) {
+        return { rows: result.users || [] };
+      });
+    }, renderUsers, force);
+  }
+
+  function renderUsers() {
+    var users = App.cache.masterUsers || [];
+    var tbody = q('#users-body');
+    if (!tbody) {
+      return;
+    }
+    if (!users.length) {
+      tbody.innerHTML = emptyRow(6, 'Tidak ada user.');
+      return;
+    }
+    tbody.innerHTML = users.map(function (user) {
+      var roleTone = user.Role === 'ADMIN' ? 'tone-navy' : 'tone-muted';
+      var isCurrent = App.user && String(App.user.UserID) === String(user.UserID);
+      var statusAction = user.Status === 'ACTIVE' ? 'Nonaktifkan' : 'Aktifkan';
+      return '<tr>' +
+        '<td><div class="user-cell"><span class="user-avatar-sm">' + esc(initials(user.NamaLengkap || user.Username)) + '</span>' +
+        '<span><strong>' + esc(user.NamaLengkap || '-') + '</strong><small>' + (isCurrent ? 'Akun Anda' : 'Akun WMS') + '</small></span></div></td>' +
+        '<td class="cell-strong">' + esc(user.Username) + '</td>' +
+        '<td><span class="status-badge ' + roleTone + '">' + esc(user.Role) + '</span></td>' +
+        '<td>' + statusBadge(user.Status) + '</td>' +
+        '<td class="cell-muted">' + esc(user.UserID) + '</td>' +
+        '<td class="text-end">' +
+        '<button type="button" class="btn btn-outline-secondary btn-icon me-1" title="Edit user" data-action="edit-user" data-id="' + esc(user.UserID) + '"><i class="fa-solid fa-pen"></i></button>' +
+        '<button type="button" class="btn btn-outline-secondary btn-icon me-1" title="Reset password" data-action="reset-user-password" data-id="' + esc(user.UserID) + '"><i class="fa-solid fa-key"></i></button>' +
+        '<button type="button" class="btn btn-outline-secondary btn-icon" title="' + statusAction + '" data-action="toggle-user-status" data-id="' + esc(user.UserID) + '" data-status="' + esc(user.Status) + '"><i class="fa-solid fa-' + (user.Status === 'ACTIVE' ? 'user-slash' : 'user-check') + '"></i></button>' +
+        '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function openUserModal(user) {
+    user = user || null;
+    var isNew = !user;
+    var body =
+      '<form id="user-form" autocomplete="off">' +
+      '<div class="row g-2">' +
+      '<div class="col-md-6"><label class="form-label">Nama Lengkap</label>' +
+      '<input type="text" class="form-control" name="namaLengkap" value="' + esc(user ? user.NamaLengkap : '') + '" required></div>' +
+      '<div class="col-md-6"><label class="form-label">Username</label>' +
+      '<input type="text" class="form-control" name="username" value="' + esc(user ? user.Username : '') + '" required>' +
+      '<div class="form-text">3-40 karakter: huruf, angka, titik, garis bawah, tanda hubung.</div></div>' +
+      '<div class="col-md-6"><label class="form-label">Role</label>' +
+      '<select class="form-select" name="role">' +
+      '<option value="STAFF"' + (user && user.Role === 'STAFF' ? ' selected' : '') + '>STAFF</option>' +
+      '<option value="ADMIN"' + (user && user.Role === 'ADMIN' ? ' selected' : '') + '>ADMIN</option>' +
+      '</select></div>' +
+      '<div class="col-md-6"><label class="form-label">Status</label>' +
+      '<select class="form-select" name="status">' +
+      '<option value="ACTIVE"' + (!user || user.Status === 'ACTIVE' ? ' selected' : '') + '>ACTIVE</option>' +
+      '<option value="INACTIVE"' + (user && user.Status === 'INACTIVE' ? ' selected' : '') + '>INACTIVE</option>' +
+      '</select></div>' +
+      '<div class="col-12"><label class="form-label">' + (isNew ? 'Password' : 'Password Baru (opsional)') + '</label>' +
+      '<input type="password" class="form-control" name="password" ' + (isNew ? 'required' : '') + ' autocomplete="new-password">' +
+      '<div class="form-text">Minimal 6 karakter. ' + (isNew ? 'Wajib untuk user baru.' : 'Kosongkan jika tidak ingin mengubah password.') + '</div></div>' +
+      '</div>' +
+      '</form>';
+
+    openDrawer(isNew ? 'Tambah User' : 'Edit User', body,
+      '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>' +
+      '<button type="submit" form="user-form" class="btn btn-primary"><i class="fa-solid fa-floppy-disk"></i> Simpan</button>',
+      'modal-lg');
+
+    safeBind(q('#user-form', q('#app-drawer-modal')), 'submit', function (event) {
+      event.preventDefault();
+      var form = event.target;
+      var payload = {
+        userID: user ? user.UserID : '',
+        namaLengkap: form.elements.namaLengkap.value,
+        username: form.elements.username.value,
+        role: form.elements.role.value,
+        status: form.elements.status.value,
+        password: form.elements.password.value
+      };
+      withLoading(callApi('saveUser', payload), 'Menyimpan user...')
+        .then(function (result) {
+          var _closeBtn = q('#app-drawer-modal .modal .btn-close'); if (_closeBtn) { _closeBtn.click(); }
+          toast('success', 'User tersimpan', result.message || 'Data user berhasil disimpan.');
+          App.cache.masterUsers = null;
+          App.loaded.users = false;
+          loadUsers(true);
+        })
+        .catch(function (err) { showError(err, 'Gagal Menyimpan User'); });
+    });
+  }
+
+  function resetUserPassword(user) {
+    user = user || {};
+    var body =
+      '<form id="reset-password-form">' +
+      '<p class="mb-3">Reset password untuk <strong>' + esc(user.Username || '-') + '</strong> (' + esc(user.NamaLengkap || '-') + ').</p>' +
+      '<label class="form-label">Password Baru</label>' +
+      '<input type="password" class="form-control" name="password" minlength="6" required autocomplete="new-password">' +
+      '<div class="form-text">Minimal 6 karakter.</div>' +
+      '</form>';
+
+    openDrawer('Reset Password', body,
+      '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>' +
+      '<button type="submit" form="reset-password-form" class="btn btn-primary"><i class="fa-solid fa-key"></i> Reset Password</button>',
+      'modal-md');
+
+    safeBind(q('#reset-password-form', q('#app-drawer-modal')), 'submit', function (event) {
+      event.preventDefault();
+      var password = event.target.elements.password.value;
+      withLoading(callApi('resetUserPassword', { userID: user.UserID, password: password }), 'Mereset password...')
+        .then(function (result) {
+          var _closeBtn = q('#app-drawer-modal .modal .btn-close'); if (_closeBtn) { _closeBtn.click(); }
+          toast('success', 'Password direset', result.message || 'Password berhasil direset.');
+        })
+        .catch(function (err) { showError(err, 'Gagal Reset Password'); });
+    });
+  }
+
+  function toggleUserStatus(user) {
+    user = user || {};
+    var nextStatus = user.Status === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE';
+    Swal.fire({
+      icon: 'question',
+      title: (nextStatus === 'ACTIVE' ? 'Aktifkan' : 'Nonaktifkan') + ' user?',
+      text: user.Username + ' akan diubah menjadi ' + nextStatus + '.',
+      showCancelButton: true,
+      confirmButtonText: 'Ya, lanjutkan',
+      cancelButtonText: 'Batal'
+    }).then(function (choice) {
+      if (!choice.isConfirmed) {
+        return;
+      }
+      withLoading(callApi('setUserStatus', { userID: user.UserID, status: nextStatus }), 'Mengubah status user...')
+        .then(function (result) {
+          toast('success', 'Status diperbarui', result.message || 'Status user berhasil diubah.');
+          App.cache.masterUsers = null;
+          App.loaded.users = false;
+          loadUsers(true);
+        })
+        .catch(function (err) { showError(err, 'Gagal Mengubah Status'); });
+    });
+  }
+
+  /* ====================================================================== */
+  /* MASTER CRUD MODAL                                                      */
+  /* ====================================================================== */
+
+  function openCreateStockOpnameModal() {
+    loadOptions().then(function () {
+      var body =
+        '<form id="create-so-form" autocomplete="off">' +
+        '<div class="row g-2">' +
+        '<div class="col-md-4"><label class="form-label">Tanggal SO</label>' +
+        '<input type="date" class="form-control" name="tanggalSO" id="create-so-tanggal" value="' + new Date().toISOString().slice(0, 10) + '" required></div>' +
+        '<div class="col-md-4"><label class="form-label">Cakupan</label>' +
+        '<select class="form-select" name="scope" id="create-so-scope">' +
+        '<option value="ALL">Semua</option>' +
+        '<option value="AREA">Per Area</option>' +
+        '<option value="LOCATION">Per Lokasi</option>' +
+        '<option value="ZONE">Per Zona</option>' +
+        '</select></div>' +
+        '<div class="col-md-4" id="create-so-area-field"><label class="form-label">Area</label>' +
+        '<input type="text" class="form-control" name="area" id="create-so-area" placeholder="Contoh: JAKARTA"></div>' +
+        '<div class="col-md-4" id="create-so-lokasi-field"><label class="form-label">Lokasi</label>' +
+        '<select class="form-select" name="lokasiID" id="create-so-lokasi">' + locationOptions('', 'Pilih lokasi...') + '</select></div>' +
+        '<div class="col-md-4" id="create-so-zone-field"><label class="form-label">Zona</label>' +
+        '<select class="form-select" name="zone" id="create-so-zone">' +
+        '<option value="">Semua Zona</option>' +
+        '<option value="Fast">Fast</option>' +
+        '<option value="Slow">Slow</option>' +
+        '</select></div>' +
+        '</div>' +
+        '</form>';
+
+      openDrawer('Buat Stock Opname (SO)', body,
+        '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>' +
+        '<button type="submit" form="create-so-form" class="btn btn-primary"><i class="fa-solid fa-plus"></i> Buat SO</button>',
+        'modal-lg');
+
+      var scopeSelect = q('#create-so-scope');
+      var areaField = q('#create-so-area-field');
+      var lokasiField = q('#create-so-lokasi-field');
+      var zoneField = q('#create-so-zone-field');
+      var toggleFields = function () {
+        if (scopeSelect) { if (lokasiField) { lokasiField.classList.toggle('d-none', scopeSelect.value !== 'LOCATION'); } }
+        if (scopeSelect) { if (areaField) { areaField.classList.toggle('d-none', scopeSelect.value === 'LOCATION'); } }
+        if (scopeSelect) { if (zoneField) { zoneField.classList.toggle('d-none', scopeSelect.value === 'LOCATION'); } }
+      };
+      if (scopeSelect) { safeBind(scopeSelect, 'change', toggleFields); }
+      toggleFields();
+
+      safeBind(q('#create-so-form', q('#app-drawer-modal')), 'submit', function (event) {
+        event.preventDefault();
+        var form = event.target;
+        var scope = (form.elements.scope && form.elements.scope.value) || 'ALL';
+        var payload = {
+          tanggalSO: form.elements.tanggalSO ? (form.elements.tanggalSO.value || '') : '',
+          scope: scope,
+          area: form.elements.area ? (form.elements.area.value || '').trim() : '',
+          lokasiID: form.elements.lokasiID ? (form.elements.lokasiID.value || '') : '',
+          zone: form.elements.zone ? (form.elements.zone.value || '') : '',
+          createdBy: App.user ? (App.user.NamaLengkap || App.user.Username) : ''
+        };
+        withLoading(callApi('createStockOpname', payload), 'Membuat Stock Opname...')
+          .then(function (result) {
+            var closeBtn = q('#app-drawer-modal .modal .btn-close');
+            if (closeBtn) { closeBtn.click(); }
+            toast('success', 'Stock Opname Dibuat', 'SO ' + (result ? result.soID : '') + ' berhasil dibuat (' + (result ? result.lineCount : 0) + ' baris).');
+            App.cache.soHeader = null;
+            App.cache.stockLogs = null;
+            App.loaded.stockMonitor = false;
+            App.loaded.stockCard = false;
+            App.loaded.opname = false;
+            loadOpname(true);
+          })
+          .catch(function (err) { showError(err, 'Buat Stock Opname Gagal'); });
+      });
+    }).catch(function (err) { showError(err, 'Gagal Memuat Opsi SO'); });
+  }
+
+  function openMasterModal(type, record) {
+    loadOptions().then(function () {
+      var config = MASTER_TABLE[type];
+      var fields = getMasterFields(type, record);
+      var body = '<form id="master-form" novalidate><div class="row g-2">' +
+        fields.map(function (field) { return masterFieldHtml(field, record); }).join('') +
+        '</div></form>';
+
+      openDrawer((record ? 'Edit ' : 'Tambah ') + config.label, body,
+        '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>' +
+        '<button type="submit" form="master-form" class="btn btn-primary"><i class="fa-solid fa-floppy-disk"></i> Simpan</button>',
+        'modal-lg');
+
+      safeBind(q('#master-form', q('#app-drawer-modal')), 'submit', function (event) {
+        event.preventDefault();
+        var form = event.target;
+        var payloadRecord = {};
+        fields.forEach(function (field) {
+          var element = form.elements[field.key];
+          if (element) {
+            payloadRecord[field.key] = element.value;
+          }
+        });
+        withLoading(callApi('saveMaster', { type: type, record: payloadRecord }), 'Menyimpan master data...')
+          .then(function (result) {
+            var _closeBtn = q('#app-drawer-modal .modal .btn-close'); if (_closeBtn) { _closeBtn.click(); }
+            toast('success', 'Master tersimpan', config.label + ' ' + result.id + ' berhasil ' + (result.mode === 'created' ? 'ditambahkan.' : 'diperbarui.'));
+            App.options = null;
+            App.loaded.master = null;
+            App.cache.masterItems = null;
+            App.cache.masterLocations = null;
+            App.cache.masterSuppliers = null;
+            App.cache.masterOutlets = null;
+            App.cache.masterUsers = null;
+            loadMaster(true);
+            loadInitialAppData().catch(function () {});
+          })
+          .catch(function (err) { showError(err, 'Simpan Master Gagal'); });
+      });
+    }).catch(function (err) { showError(err, 'Gagal Memuat Opsi'); });
+  }
+
+  function masterFieldHtml(field, record) {
+    var value = record && record[field.key] !== undefined && record[field.key] !== null ? record[field.key] : (field.defaultValue || '');
+    var readonly = field.readonly ? ' readonly' : '';
+    var required = field.required ? ' required' : '';
+    var label = '<label class="form-label">' + esc(field.label) + '</label>';
+
+    if (field.type === 'select') {
+      var options = field.options || [];
+      var optionsHtml = '';
+      if (field.placeholder !== undefined) {
+        optionsHtml += '<option value="">' + esc(field.placeholder) + '</option>';
+      }
+      options.forEach(function (option) {
+        var optionValue = typeof option === 'string' ? option : option.value;
+        var optionLabel = typeof option === 'string' ? option : option.label;
+        optionsHtml += '<option value="' + esc(optionValue) + '"' + (String(value) === String(optionValue) ? ' selected' : '') + '>' + esc(optionLabel) + '</option>';
+      });
+      return '<div class="' + (field.col || 'col-md-6') + '">' + label +
+        '<select class="form-select" name="' + esc(field.key) + '"' + required + '>' + optionsHtml + '</select></div>';
+    }
+
+    if (field.type === 'textarea') {
+      return '<div class="' + (field.col || 'col-12') + '">' + label +
+        '<textarea class="form-control" name="' + esc(field.key) + '" rows="2"' + readonly + required + '>' + esc(value) + '</textarea></div>';
+    }
+
+    return '<div class="' + (field.col || 'col-md-6') + '">' + label +
+      '<input type="' + esc(field.type || 'text') + '" class="form-control" name="' + esc(field.key) + '" value="' + esc(value) + '"' + readonly + required + '></div>';
+  }
+
+  function getMasterFields(type, record) {
+    var locationOptionsList = ((App.options && App.options.locations) || []).map(function (location) {
+      var lokasiID = location.LokasiID || location.LocationID || '';
+      return { value: lokasiID, label: lokasiID + ' - ' + (location.Area || location.Zone || '') };
+    });
+
+    if (type === 'items') {
+      return [
+        { key: 'SKU', label: 'SKU', required: true, readonly: !!record, col: 'col-md-4' },
+        { key: 'NamaBarang', label: 'Nama Barang', required: true, col: 'col-md-8' },
+        { key: 'Kategori', label: 'Kategori', col: 'col-md-4' },
+        { key: 'Zone', label: 'Zone', type: 'select', options: ['Fast', 'Slow'], col: 'col-md-4' },
+        { key: 'RakDefault', label: 'Rak Default', type: 'select', options: locationOptionsList, placeholder: '-', col: 'col-md-4' },
+        { key: 'MinStock', label: 'Min Stock', type: 'number', defaultValue: 0, col: 'col-md-3' },
+        { key: 'MaxStock', label: 'Max Stock', type: 'number', defaultValue: 0, col: 'col-md-3' },
+        { key: 'Satuan', label: 'Satuan', defaultValue: 'PCS', col: 'col-md-3' },
+        { key: 'Status', label: 'Status', type: 'select', options: ['Active', 'Inactive'], col: 'col-md-3' }
+      ];
+    }
+    if (type === 'locations') {
+      return [
+        { key: 'LokasiID', label: 'Lokasi ID', required: true, readonly: !!record, col: 'col-md-4' },
+        { key: 'Area', label: 'Area', col: 'col-md-4' },
+        { key: 'Zone', label: 'Zone', type: 'select', options: ['Fast', 'Slow'], col: 'col-md-4' },
+        { key: 'Aisle', label: 'Aisle', col: 'col-md-4' },
+        { key: 'Bin', label: 'Bin', col: 'col-md-4' },
+        { key: 'Capacity', label: 'Capacity', type: 'number', defaultValue: 0, col: 'col-md-4' },
+        { key: 'CurrentQty', label: 'Current Qty', type: 'number', defaultValue: 0, col: 'col-md-4' },
+        { key: 'Status', label: 'Status', type: 'select', options: ['Available', 'Full'], col: 'col-md-4' }
+      ];
+    }
+    if (type === 'suppliers') {
+      return [
+        { key: 'SupplierID', label: 'Supplier ID', required: true, readonly: !!record, col: 'col-md-4' },
+        { key: 'NamaSupplier', label: 'Nama Supplier', required: true, col: 'col-md-8' },
+        { key: 'Kontak', label: 'Kontak', col: 'col-md-4' },
+        { key: 'Alamat', label: 'Alamat', type: 'textarea', col: 'col-12' }
+      ];
+    }
+    if (type === 'outlets') {
+      return [
+        { key: 'OutletID', label: 'Outlet ID', required: true, readonly: !!record, col: 'col-md-4' },
+        { key: 'NamaOutlet', label: 'Nama Outlet', required: true, col: 'col-md-8' },
+        { key: 'Alamat', label: 'Alamat', type: 'textarea', col: 'col-12' },
+        { key: 'Kontak', label: 'Kontak', col: 'col-md-4' }
+      ];
+    }
+    if (type === 'users') {
+      return [
+        { key: 'Username', label: 'Username', required: true, readonly: !!record, col: 'col-md-4' },
+        { key: 'NamaLengkap', label: 'Nama Lengkap', required: true, col: 'col-md-8' },
+        { key: 'Role', label: 'Role', type: 'select', options: ['STAFF', 'ADMIN'], col: 'col-md-4' },
+        { key: 'Status', label: 'Status', type: 'select', options: ['ACTIVE', 'INACTIVE'], col: 'col-md-4' }
+      ];
+    }
+    return [
+      { key: 'OutletID', label: 'Outlet ID', required: true, readonly: !!record, col: 'col-md-4' },
+      { key: 'NamaOutlet', label: 'Nama Outlet', required: true, col: 'col-md-8' },
+      { key: 'Alamat', label: 'Alamat', type: 'textarea', col: 'col-12' },
+      { key: 'Kontak', label: 'Kontak', col: 'col-md-4' }
+    ];
+  }
+
+  /* ====================================================================== */
+  /* VIEW NAVIGATION                                                        */
+  /* ====================================================================== */
+
+  function setActiveNav(view) {
+    qa('[data-view]').forEach(function (item) {
+      if (!item.classList.contains('sidebar-link')) {
+        return;
+      }
+      item.classList.toggle('active', item.getAttribute('data-view') === view);
+    });
+  }
+
+  function showView(view, force) {
+    var meta = VIEW_META[view];
+    if (!meta) {
+      view = App.role === 'ADMIN' ? 'dashboard' : 'inventory';
+      meta = VIEW_META[view];
+    }
+    if (meta.permission && !can(meta.permission)) {
+      view = App.role === 'ADMIN' ? 'dashboard' : 'inventory';
+      meta = VIEW_META[view];
+    }
+
+    App.activeView = view;
+    qa('.app-view').forEach(function (section) {
+      section.classList.toggle('active', section.id === 'view-' + view);
+    });
+    setActiveNav(view);
+
+    setText('#page-title', meta.title);
+    setText('#page-subtitle', meta.subtitle);
+    document.body.classList.remove('sidebar-open');
+
+    if (App.booted) {
+      ensureViewData(view, force);
+    }
+  }
+
+  function ensureViewData(view, force) {
+    if (view === 'dashboard') {
+      loadInitialAppData().catch(function () {});
+      return;
+    }
+    if (view === 'inventory') {
+      loadOptions().catch(function () {});
+      if (App.invTab === 'logs') {
+        loadStockCard();
+      } else {
+        loadStockMonitoring(force);
+      }
+      return;
+    }
+    if (view === 'inbound') {
+      if (App.inboundTab === 'receiving') {
+        loadInboundReceiving(force);
+      } else if (App.inboundTab === 'quarantine') {
+        loadQuarantine(force);
+      } else {
+        loadClaims(force);
+      }
+      return;
+    }
+    if (view === 'outbound') {
+      if (App.outboundTab === 'orders') {
+        loadOutboundOrders(force);
+      } else if (App.outboundTab === 'picking') {
+        loadPickingList(force);
+      } else {
+        loadDispatchManifest(force);
+      }
+      return;
+    }
+    if (view === 'opname') {
+      loadOpname(force);
+      return;
+    }
+    if (view === 'master') {
+      loadMaster(force);
+      return;
+    }
+    if (view === 'users') {
+      loadUsers(force);
+      return;
+    }
+    if (view === 'sync') {
+      loadSync(force);
+      return;
+    }
+    if (view === 'adjustment') {
+      loadOptions().then(function () {
+        populateAdjustmentForms();
+      }).catch(function () {});
+      loadAdjustmentLogs(force);
+      return;
+    }
+    if (view === 'approval') {
+      loadApproval(force);
+      return;
+    }
+  }
+
+  function applyInventoryTab(tab) {
+    App.invTab = tab;
+    qa('[data-inv-tab].module-tab').forEach(function (button) {
+      button.classList.toggle('active', button.getAttribute('data-inv-tab') === tab);
+    });
+    var balancePanel = q('#inventory-balance-panel');
+    var logsPanel = q('#inventory-logs-panel');
+    if (balancePanel) {
+      balancePanel.classList.toggle('active', tab === 'balance');
+    }
+    if (logsPanel) {
+      logsPanel.classList.toggle('active', tab === 'logs');
+    }
+    if (App.activeView === 'inventory') {
+      setText('#page-title', tab === 'logs' ? 'Kartu Stok' : 'Monitoring Stok');
+      setText('#page-subtitle', tab === 'logs'
+        ? 'Saldo Awal, Saldo Masuk, Saldo Keluar, dan Saldo Akhir per mutasi'
+        : 'Rolling stock: Saldo Awal + Saldo Masuk - Saldo Keluar = Saldo Akhir');
+      setActiveNav('inventory');
+    }
+    if (tab === 'logs') {
+      loadStockCard();
+    } else {
+      loadStockMonitoring(true);
+    }
+  }
+
+  function switchInventoryTab(tab) {
+    applyInventoryTab(tab);
+  }
+
+  function applyInboundTab(tab) {
+    App.inboundTab = tab;
+    qa('[data-inbound-tab].module-tab').forEach(function (button) {
+      button.classList.toggle('active', button.getAttribute('data-inbound-tab') === tab);
+    });
+    ['receiving', 'quarantine', 'claims'].forEach(function (name) {
+      var panel = q('#inbound-' + name + '-panel');
+      if (panel) {
+        panel.classList.toggle('active', tab === name);
+      }
+    });
+    if (App.activeView === 'inbound') {
+      setActiveNav('inbound');
+    }
+    if (tab === 'receiving') {
+      loadInboundReceiving(true);
+    } else if (tab === 'quarantine') {
+      loadQuarantine(true);
+    } else {
+      loadClaims(true);
+    }
+  }
+
+  function applyOutboundTab(tab) {
+    App.outboundTab = tab;
+    qa('[data-outbound-tab].module-tab').forEach(function (button) {
+      button.classList.toggle('active', button.getAttribute('data-outbound-tab') === tab);
+    });
+    ['orders', 'picking', 'manifest'].forEach(function (name) {
+      var panel = q('#outbound-' + name + '-panel');
+      if (panel) {
+        panel.classList.toggle('active', tab === name);
+      }
+    });
+    if (App.activeView === 'outbound') {
+      setActiveNav('outbound');
+    }
+    if (tab === 'orders') {
+      loadOutboundOrders(true);
+    } else if (tab === 'picking') {
+      loadPickingList(true);
+    } else {
+      loadDispatchManifest(true);
+    }
+  }
+
+  function switchMasterType(type) {
+    App.masterType = type;
+    App.filters.master.type = type;
+    App.filters.master.page = 1;
+    App.filters.master.search = '';
+    var search = q('#master-search');
+    if (search) {
+      search.value = '';
+    }
+    qa('[data-master-type]').forEach(function (button) {
+      button.classList.toggle('active', button.getAttribute('data-master-type') === type);
+    });
+    var config = MASTER_TABLE[type];
+    setText('#master-add-label', config ? config.label : 'Data');
+    var addButton = q('#btn-add-master');
+    if (addButton) {
+      addButton.classList.toggle('d-none', type === 'sync');
+    }
+    loadMaster(true);
+  }
+
+  /* ====================================================================== */
+  /* INVALIDATE / REFRESH                                                   */
+  /* ====================================================================== */
+
+  function invalidateData(keys) {
+    (keys || []).forEach(function (key) {
+      if (key === 'master') {
+        App.loaded.master = null;
+      } else if (App.cache[key] !== undefined) {
+        App.cache[key] = null;
+      } else {
+        App.loaded[key] = false;
+      }
+    });
+  }
+
+  function currentViewRefresh(force) {
+    ensureViewData(App.activeView, force !== false);
+  }
+
+  /* ====================================================================== */
+  /* EVENT BINDING                                                          */
+  /* ====================================================================== */
+
+  function bindAuthEvents() {
+    // Form login ditangani oleh onsubmit="return handleLogin(event)" di HTML,
+    // jangan pasang listener submit di sini untuk menghindari double handling.
+
+    var toggle = q('#login-password-toggle');
+    if (toggle) {
+      safeBind(toggle, 'click', function () {
+        var input = q('#login-password');
+        var icon = toggle.querySelector('i');
+        if (!input) {
+          return;
+        }
+        var show = input.type === 'password';
+        input.type = show ? 'text' : 'password';
+        if (icon) {
+          icon.className = show ? 'fa-regular fa-eye-slash' : 'fa-regular fa-eye';
+        }
+        toggle.setAttribute('aria-label', show ? 'Sembunyikan password' : 'Tampilkan password');
+      });
+    }
+
+    var year = q('#login-year');
+    if (year) {
+      year.textContent = String(new Date().getFullYear());
+    }
+
+    var logout = q('#btn-logout');
+    if (logout) {
+      safeBind(logout, 'click', function () {
+        Swal.fire({
+          icon: 'question',
+          title: 'Keluar dari aplikasi?',
+          text: 'Sesi Anda akan diakhiri dan halaman login ditampilkan kembali.',
+          showCancelButton: true,
+          confirmButtonText: 'Ya, keluar',
+          cancelButtonText: 'Batal'
+        }).then(function (choice) {
+          if (choice && choice.isConfirmed) {
+            logoutUser();
+          }
+        });
+      });
+    }
+  }
+
+  function bindEvents() {
+    if (App.eventsBound) {
+      return;
+    }
+    qa('[data-view]').forEach(function (item) {
+      safeBind(item, 'click', function (event) {
+        event.preventDefault();
+        var invTab = item.getAttribute('data-inv-tab');
+        if (invTab) {
+          applyInventoryTab(invTab);
+        }
+        showView(item.getAttribute('data-view'));
+      });
+    });
+
+    qa('[data-inv-tab].module-tab').forEach(function (button) {
+      safeBind(button, 'click', function () {
+        switchInventoryTab(button.getAttribute('data-inv-tab'));
+      });
+    });
+
+    qa('[data-inbound-tab].module-tab').forEach(function (button) {
+      safeBind(button, 'click', function () {
+        applyInboundTab(button.getAttribute('data-inbound-tab'));
+      });
+    });
+
+    qa('[data-outbound-tab].module-tab').forEach(function (button) {
+      safeBind(button, 'click', function () {
+        applyOutboundTab(button.getAttribute('data-outbound-tab'));
+      });
+    });
+
+    qa('[data-master-type]').forEach(function (button) {
+      safeBind(button, 'click', function () {
+        switchMasterType(button.getAttribute('data-master-type'));
+      });
+    });
+
+    safeBind('#sidebar-toggle', 'click', function () {
+      document.body.classList.toggle('sidebar-open');
+    });
+    safeBind('#sidebar-backdrop', 'click', function () {
+      document.body.classList.remove('sidebar-open');
+    });
+    safeBind('#sidebar-refresh-all', 'click', function (event) {
+      event.preventDefault();
+      App.loaded = {};
+      App.cache = {
+        stockLogs: null,
+        inboundReceiving: null,
+        quarantine: null,
+        claims: null,
+        outboundOrders: null,
+        pickingList: null,
+        dispatchManifest: null,
+        soHeader: null,
+        soDetail: null,
+        syncHistory: null,
+        masterItems: null,
+        masterLocations: null,
+        masterSuppliers: null,
+        masterOutlets: null,
+        masterUsers: null
+      };
+      App.options = null;
+      loadInitialAppData().catch(function () {});
+      currentViewRefresh(true);
+      toast('info', 'Refresh', 'Data sedang dimuat ulang.');
+    });
+    safeBind('#btn-refresh-page', 'click', function () {
+      App.loaded[App.activeView] = false;
+      currentViewRefresh(true);
+      loadInitialAppData().catch(function () {});
+    });
+    safeBind('#btn-sync-manual', 'click', function (event) {
+      event.preventDefault();
+      runSync(true);
+    });
+    safeBind('#btn-quick-sync', 'click', function (event) {
+      event.preventDefault();
+      runSync(true);
+    });
+    safeBind('#btn-sync-now', 'click', function (event) {
+      event.preventDefault();
+      runSync(true).then(function () {
+        loadSync(true);
+      }).catch(function () {});
+    });
+
+    /* Monitoring Stok filters */
+    safeBind('#stock-monitor-produk', 'input', debounce(function (event) {
+      App.filters.stockMonitor.search = event.target.value;
+      applyStockMonitorFilters();
+      renderStockMonitorTable();
+      renderStockMonitorFooter();
+      renderStockMonitorPager();
+      renderStockMonitorStatusChips();
+    }, 300));
+    safeBind('#stock-monitor-kategori', 'change', function (event) {
+      App.filters.stockMonitor.kategori = event.target.value;
+      applyStockMonitorFilters();
+      renderStockMonitorTable();
+      renderStockMonitorFooter();
+      renderStockMonitorPager();
+      renderStockMonitorStatusChips();
+    });
+    safeBind('#stock-monitor-reset', 'click', function () {
+      App.filters.stockMonitor.search = '';
+      App.filters.stockMonitor.kategori = '';
+      App.filters.stockMonitor.status = '';
+      q('#stock-monitor-produk').value = '';
+      q('#stock-monitor-kategori').value = '';
+      applyStockMonitorFilters();
+      renderStockMonitorTable();
+      renderStockMonitorFooter();
+      renderStockMonitorPager();
+      renderStockMonitorStatusChips();
+    });
+    safeBind('#stock-monitor-export', 'click', exportMonitorCsv);
+
+    /* Toolbar: + Input Baru & Sync pada modul inventory */
+    safeBind('#stock-monitor-sync', 'click', function (event) {
+      event.preventDefault();
+      runSync(true);
+    });
+
+    var chipsContainer = q('#stock-monitor-status-chips');
+    if (chipsContainer) {
+      safeBind(chipsContainer, 'click', function (event) {
+        var chip = event.target.closest('.status-chip');
+        if (!chip) {
+          return;
+        }
+        App.filters.stockMonitor.status = chip.getAttribute('data-status');
+        applyStockMonitorFilters();
+        renderStockMonitorTable();
+        renderStockMonitorFooter();
+        renderStockMonitorPager();
+        renderStockMonitorStatusChips();
+      });
+    }
+
+    /* Pager delegation: Monitoring Stok & Kartu Stok */
+    ['#stock-monitor-pager', '#stock-card-pager'].forEach(function (sel) {
+      var cont = q(sel);
+      if (!cont) {
+        return;
+      }
+      safeBind(cont, 'click', function (event) {
+        var btn = event.target.closest('button[data-page]');
+        if (!btn) {
+          return;
+        }
+        var isMonitor = sel === '#stock-monitor-pager';
+        var f = isMonitor ? App.filters.stockMonitor : App.filters.stockCard;
+        var total = isMonitor ? App.states.stockMonitor.filteredRows.length : App.states.stockCard.allRows.length;
+        var totalPages = Math.max(Math.ceil(total / f.pageSize), 1);
+        var dir = btn.getAttribute('data-page');
+        var np = dir === 'prev' ? f.page - 1 : f.page + 1;
+        if (np >= 1 && np <= totalPages) {
+          f.page = np;
+          if (isMonitor) {
+            renderStockMonitorTable();
+            renderStockMonitorFooter();
+            renderStockMonitorPager();
+          } else {
+            renderStockCardTable();
+            renderStockCardPager();
+          }
+        }
+      });
+      safeBind(cont, 'change', function (event) {
+        var selEl = event.target.closest('select.monitor-page-size, select.card-page-size');
+        if (!selEl) {
+          return;
+        }
+        var isMonitor = sel === '#stock-monitor-pager';
+        var f = isMonitor ? App.filters.stockMonitor : App.filters.stockCard;
+        f.pageSize = parseInt(selEl.value, 10) || 25;
+        f.page = 1;
+        if (isMonitor) {
+          renderStockMonitorTable();
+          renderStockMonitorFooter();
+          renderStockMonitorPager();
+        } else {
+          renderStockCardTable();
+          renderStockCardPager();
+        }
+      });
+    });
+
+    /* Kartu Stok filters */
+    safeBind('#card-start-date', 'change', function () {
+      App.filters.stockCard.startDate = this.value;
+      loadStockCard();
+    });
+    safeBind('#card-end-date', 'change', function () {
+      App.filters.stockCard.endDate = this.value;
+      loadStockCard();
+    });
+    safeBind('#card-tipe-filter', 'change', function () {
+      App.filters.stockCard.tipe = this.value;
+      loadStockCard();
+    });
+    safeBind('#card-refresh', 'click', function () {
+      loadStockCard();
+    });
+
+    /* Inbound filters */
+    safeBind('#inbound-search', 'input', debounce(function (event) {
+      App.filters.inbound.search = event.target.value;
+      App.filters.inbound.page = 1;
+      loadInboundReceiving(true);
+    }, 300));
+    safeBind('#inbound-status-filter', 'change', function (event) {
+      App.filters.inbound.status = event.target.value;
+      App.filters.inbound.page = 1;
+      loadInboundReceiving(true);
+    });
+    safeBind('#btn-inbound-refresh', 'click', function () {
+      loadInboundReceiving(true);
+    });
+
+    safeBind('#quarantine-search', 'input', debounce(function (event) {
+      App.filters.quarantine.search = event.target.value;
+      App.filters.quarantine.page = 1;
+      loadQuarantine(true);
+    }, 300));
+    safeBind('#quarantine-status-filter', 'change', function (event) {
+      App.filters.quarantine.status = event.target.value;
+      App.filters.quarantine.page = 1;
+      loadQuarantine(true);
+    });
+    safeBind('#btn-quarantine-refresh', 'click', function () {
+      loadQuarantine(true);
+    });
+
+    safeBind('#claims-search', 'input', debounce(function (event) {
+      App.filters.claims.search = event.target.value;
+      App.filters.claims.page = 1;
+      loadClaims(true);
+    }, 300));
+    safeBind('#claims-status-filter', 'change', function (event) {
+      App.filters.claims.status = event.target.value;
+      App.filters.claims.page = 1;
+      loadClaims(true);
+    });
+    safeBind('#btn-claims-refresh', 'click', function () {
+      loadClaims(true);
+    });
+
+    /* Outbound filters */
+    safeBind('#outbound-search', 'input', debounce(function (event) {
+      App.filters.outbound.search = event.target.value;
+      App.filters.outbound.page = 1;
+      loadOutboundOrders(true);
+    }, 300));
+    safeBind('#outbound-status-filter', 'change', function (event) {
+      App.filters.outbound.status = event.target.value;
+      App.filters.outbound.page = 1;
+      loadOutboundOrders(true);
+    });
+    safeBind('#btn-outbound-refresh', 'click', function () {
+      loadOutboundOrders(true);
+    });
+
+    safeBind('#picking-search', 'input', debounce(function (event) {
+      App.filters.picking.search = event.target.value;
+      App.filters.picking.page = 1;
+      loadPickingList(true);
+    }, 300));
+    safeBind('#picking-status-filter', 'change', function (event) {
+      App.filters.picking.status = event.target.value;
+      App.filters.picking.page = 1;
+      loadPickingList(true);
+    });
+    safeBind('#btn-picking-refresh', 'click', function () {
+      loadPickingList(true);
+    });
+
+    safeBind('#manifest-search', 'input', debounce(function (event) {
+      App.filters.manifest.search = event.target.value;
+      App.filters.manifest.page = 1;
+      loadDispatchManifest(true);
+    }, 300));
+    safeBind('#manifest-status-filter', 'change', function (event) {
+      App.filters.manifest.status = event.target.value;
+      App.filters.manifest.page = 1;
+      loadDispatchManifest(true);
+    });
+    safeBind('#btn-manifest-refresh', 'click', function () {
+      loadDispatchManifest(true);
+    });
+
+    /* Opname filters */
+    safeBind('#opname-search', 'input', debounce(function (event) {
+      App.filters.opname.search = event.target.value;
+      App.filters.opname.page = 1;
+      loadOpname(true);
+    }, 300));
+    safeBind('#opname-status-filter', 'change', function (event) {
+      App.filters.opname.status = event.target.value;
+      App.filters.opname.page = 1;
+      loadOpname(true);
+    });
+    safeBind('#btn-create-opname', 'click', function () {
+      openCreateStockOpnameModal();
+    });
+    safeBind('#btn-opname-refresh', 'click', function () {
+      loadOpname(true);
+    });
+
+    /* Approval filters */
+    safeBind('#approval-search', 'input', debounce(function (event) {
+      App.filters.approval.search = event.target.value;
+      App.filters.approval.page = 1;
+      loadApproval(true);
+    }, 300));
+    safeBind('#approval-status-filter', 'change', function (event) {
+      App.filters.approval.status = event.target.value || 'ALL';
+      App.filters.approval.page = 1;
+      loadApproval(true);
+    });
+    safeBind('#btn-approval-refresh', 'click', function () {
+      loadApproval(true);
+    });
+
+    /* Master filters */
+    safeBind('#master-search', 'input', debounce(function (event) {
+      App.filters.master.search = event.target.value;
+      App.filters.master.page = 1;
+      loadMaster(true);
+    }, 300));
+    safeBind('#btn-add-master', 'click', function () {
+      if (App.masterType === 'users') {
+        openUserModal(null);
+      } else if (App.masterType === 'sync') {
+        toast('info', 'Sync Logs', 'Riwayat sinkronisasi dibuat otomatis oleh sistem.');
+      } else {
+        openMasterModal(App.masterType, null);
+      }
+    });
+    safeBind('#btn-master-refresh', 'click', function () {
+      loadMaster(true);
+    });
+
+    /* Users */
+    safeBind('#users-search', 'input', debounce(function (event) {
+      App.filters.master.search = event.target.value;
+      loadUsers(true);
+    }, 300));
+    safeBind('#btn-add-user', 'click', function () {
+      openUserModal(null);
+    });
+    safeBind('#btn-users-refresh', 'click', function () {
+      App.cache.masterUsers = null;
+      loadUsers(true);
+    });
+
+    /* Adjustment / Transfer inline forms */
+    safeBind('#adjustment-inline-form', 'submit', function (event) {
+      event.preventDefault();
+      var form = event.target;
+      var payload = {
+        sku: form.elements.sku.value,
+        locationID: form.elements.locationID.value,
+        qty: form.elements.qty.value,
+        refDoc: form.elements.refDoc.value,
+        reason: form.elements.reason.value,
+        user: App.user ? (App.user.NamaLengkap || App.user.Username) : ''
+      };
+      withLoading(callApi('processStockAdjustment', payload), 'Menyimpan adjustment...')
+        .then(function (result) {
+          toast('success', 'Adjustment tersimpan', 'Saldo akhir ' + fmtNum(result.saldoAkhir) + ' untuk SKU ' + result.sku + '.');
+          form.reset();
+          App.cache.stockLogs = null;
+          App.loaded.stockMonitor = false;
+          App.loaded.stockCard = false;
+          loadAdjustmentLogs(true);
+          loadInitialAppData().catch(function () {});
+        })
+        .catch(function (err) { showError(err, 'Adjustment Gagal'); });
+    });
+
+    safeBind('#transfer-inline-form', 'submit', function (event) {
+      event.preventDefault();
+      var form = event.target;
+      var payload = {
+        sku: form.elements.sku.value,
+        fromLocationID: form.elements.fromLocationID.value,
+        toLocationID: form.elements.toLocationID.value,
+        qty: form.elements.qty.value,
+        refDoc: form.elements.refDoc.value,
+        user: App.user ? (App.user.NamaLengkap || App.user.Username) : ''
+      };
+      withLoading(callApi('processStockTransfer', payload), 'Memproses transfer...')
+        .then(function (result) {
+          toast('success', 'Transfer berhasil', fmtNum(result.qty) + ' unit dipindahkan.');
+          form.reset();
+          App.cache.stockLogs = null;
+          App.loaded.stockMonitor = false;
+          App.loaded.stockCard = false;
+          loadAdjustmentLogs(true);
+          loadInitialAppData().catch(function () {});
+        })
+        .catch(function (err) { showError(err, 'Transfer Gagal'); });
+    });
+
+    /* Global action delegation */
+    document.addEventListener('click', function (event) {
+      var actionButton = event.target.closest('[data-action]');
+      if (!actionButton) {
+        return;
+      }
+      var action = actionButton.getAttribute('data-action');
+      if (action === 'stock-card') {
+        openStockCard(actionButton.getAttribute('data-sku'));
+      } else if (action === 'stock-log-confirm') {
+        openStockLogConfirm(actionButton);
+      } else if (action === 'quick-create') {
+        openQuickCreate(actionButton);
+      } else if (action === 'txn-confirm') {
+        openTxnConfirm(actionButton);
+      } else if (action === 'stock-adjust') {
+        openAdjustmentModal({
+          sku: actionButton.getAttribute('data-sku'),
+          location: actionButton.getAttribute('data-location')
+        });
+      } else if (action === 'inbound-detail') {
+        openInboundDetail(actionButton.getAttribute('data-id'));
+      } else if (action === 'outbound-detail') {
+        openOutboundDetail(actionButton.getAttribute('data-id'));
+      } else if (action === 'outbound-status') {
+        openOutboundStatus(actionButton.getAttribute('data-id'), actionButton.getAttribute('data-status'));
+      } else if (action === 'manifest-edit') {
+        openOutboundDetail(actionButton.getAttribute('data-id'));
+      } else if (action === 'opname-count') {
+        openBlindCount(actionButton.getAttribute('data-id'));
+      } else if (action === 'opname-variance') {
+        openVariance(actionButton.getAttribute('data-id'));
+      } else if (action === 'edit-master') {
+        var type = actionButton.getAttribute('data-type');
+        var id = actionButton.getAttribute('data-id');
+        var record = (App.masterRows[type] || {})[String(id).toUpperCase()];
+        if (type === 'users') {
+          openUserModal(record || null);
+        } else if (type !== 'sync') {
+          openMasterModal(type, record || null);
+        }
+      } else if (action === 'edit-user') {
+        var userID = actionButton.getAttribute('data-id');
+        var user = (App.cache.masterUsers || []).find(function (u) { return String(u.UserID) === String(userID); });
+        if (user) {
+          openUserModal(user);
+        }
+      } else if (action === 'reset-user-password') {
+        var resetID = actionButton.getAttribute('data-id');
+        var resetUser = (App.cache.masterUsers || []).find(function (u) { return String(u.UserID) === String(resetID); });
+        if (resetUser) {
+          resetUserPassword(resetUser);
+        }
+      } else if (action === 'toggle-user-status') {
+        var toggleID = actionButton.getAttribute('data-id');
+        var toggleUser = (App.cache.masterUsers || []).find(function (u) { return String(u.UserID) === String(toggleID); });
+        if (toggleUser) {
+          toggleUserStatus(toggleUser);
+        }
+      } else if (action === 'quarantine-disposition') {
+        openQuarantineDisposition(actionButton.getAttribute('data-id'));
+      }
+    });
+    App.eventsBound = true;
+  }
+
+  function openInboundReceivingModal() {
+    loadOptions().then(function () {
+      var body =
+        '<form id="inbound-receiving-form" autocomplete="off">' +
+        '<div class="row g-2">' +
+        '<div class="col-md-6"><label class="form-label">No Surat Jalan</label>' +
+        '<input type="text" class="form-control" name="noSJ" id="inbound-rcv-noSJ" placeholder="Contoh: SJ-2026-001" required></div>' +
+        '<div class="col-md-6"><label class="form-label">Supplier</label>' +
+        '<select class="form-select" name="supplierID" id="inbound-rcv-supplier" required>' +
+        '<option value="">Pilih Supplier...</option>' +
+        ((App.options && App.options.suppliers) || []).map(function (supplier) {
+          var supplierID = supplier.SupplierID || supplier.SupplierCode || '';
+          var nama = supplier.NamaSupplier || supplier.Name || '';
+          return '<option value="' + esc(supplierID) + '">' + esc(nama || supplierID) + '</option>';
+        }).join('') +
+        '</select></div>' +
+        '<div class="col-md-6"><label class="form-label">Lokasi</label>' +
+        '<select class="form-select" name="lokasiID" id="inbound-rcv-lokasi" required>' +
+        locationOptions('', 'Pilih lokasi...') +
+        '</select></div>' +
+        '<div class="col-md-6"><label class="form-label">SKU</label>' +
+        '<select class="form-select" name="sku" id="inbound-rcv-sku" required>' +
+        itemOptions('') +
+        '</select></div>' +
+        '<div class="col-md-6"><label class="form-label">Qty Diterima</label>' +
+        '<input type="number" class="form-control" name="qtyDiterima" id="inbound-rcv-qtyDiterima" min="1" step="1" required></div>' +
+        '<div class="col-md-6"><label class="form-label">Qty Baik</label>' +
+        '<input type="number" class="form-control" name="qtyBaik" id="inbound-rcv-qtyBaik" min="0" step="1" placeholder="Kosongkan = semua baik"></div>' +
+        '<div class="col-md-6"><label class="form-label">Qty Cacat</label>' +
+        '<input type="number" class="form-control" name="qtyCacat" id="inbound-rcv-qtyCacat" min="0" step="1" placeholder="Kosongkan = qty baik"></div>' +
+        '<div class="col-md-12"><label class="form-label">Catatan</label>' +
+        '<textarea class="form-control" name="note" id="inbound-rcv-note" rows="2"></textarea></div>' +
+        '</div>' +
+        '</form>';
+      openDrawer('Input Receiving Inbound (Web)', body,
+        '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>' +
+        '<button type="submit" form="inbound-receiving-form" class="btn btn-primary"><i class="fa-solid fa-truck-ramp-box"></i> Simpan Receiving</button>',
+        'modal-lg');
+
+      safeBind(q('#inbound-receiving-form', q('#app-drawer-modal')), 'submit', function (event) {
+        event.preventDefault();
+        var form = event.target;
+        var qtyDiterima = Number(form.elements.qtyDiterima ? form.elements.qtyDiterima.value : 0) || 0;
+        var qtyBaik = Number(form.elements.qtyBaik ? form.elements.qtyBaik.value : 0) || qtyDiterima;
+        var qtyCacat = Math.max(0, qtyDiterima - qtyBaik);
+        var payload = {
+          noSJ: form.elements.noSJ ? (form.elements.noSJ.value || '').trim() : '',
+          supplierID: form.elements.supplierID ? (form.elements.supplierID.value || '') : '',
+          items: [{
+            sku: form.elements.sku ? (form.elements.sku.value || '') : '',
+            lokasiID: form.elements.lokasiID ? (form.elements.lokasiID.value || '') : '',
+            qtyDiterima: qtyDiterima,
+            qtyBaik: qtyBaik,
+            qtyCacat: qtyCacat,
+            note: form.elements.note ? (form.elements.note.value || '') : ''
+          }],
+          createdBy: App.user ? (App.user.NamaLengkap || App.user.Username) : ''
+        };
+        withLoading(callApi('processReceiving', payload), 'Menyimpan Receiving...')
+          .then(function (result) {
+            var closeBtn = q('#app-drawer-modal .modal .btn-close');
+            if (closeBtn) { closeBtn.click(); }
+            toast('success', 'Receiving Tersimpan', 'RCV ' + (result && result.rcvID ? result.rcvID : '') + ' berhasil diproses.');
+            App.cache.inboundReceiving = null;
+            App.cache.quarantine = null;
+            App.loaded.stockMonitor = false;
+            loadInitialAppData().catch(function () {});
+            loadInboundReceiving(true);
+          })
+          .catch(function (err) { showError(err, 'Simpan Receiving Gagal'); });
+      });
+    }).catch(function (err) { showError(err, 'Gagal Memuat Opsi Inbound'); });
+  }
+
+  function openQuickCreate(actionButton) {
+    var module = normalizeKey_(actionButton.getAttribute('data-module'));
+    if (module === 'INVENTORY' || module === 'STOCK') {
+      var searchInput = q('#stock-monitor-produk');
+      var sku = String((searchInput && searchInput.value) || '').trim();
+      if (!sku) {
+        toast('info', 'Input Baru', 'Isi kolom pencarian SKU / nama barang terlebih dahulu, lalu buka form adjustment.');
+        return;
+      }
+      openAdjustmentModal({ sku: sku });
+      return;
+    }
+    if (module === 'INBOUND') {
+      openInboundReceivingModal();
+      return;
+    }
+    if (module === 'OUTBOUND') {
+      toast('info', 'Input Baru', 'Input outbound / pengiriman via form web disimpan melalui OUTBOUND_CONFIRMATIONS setelah diproses picking.');
+      return;
+    }
+    if (module === 'STOCK_OPNAME' || module === 'OPNAME') {
+      toast('info', 'Input Baru', 'Stock opname via web menggunakan alur blind count dan BASO approval.');
+      return;
+    }
+    toast('info', 'Input Baru', 'Form input untuk modul ' + module + ' belum tersedia.');
+  }
+
+  function openTxnConfirm(actionButton) {
+    var module = normalizeKey_(actionButton.getAttribute('data-module'));
+    var id = actionButton.getAttribute('data-id') || '';
+    var statusShipment = actionButton.getAttribute('data-status') || '';
+    var idFields = {
+      INBOUND_RECEIVING: 'RcvID',
+      QUARANTINE_RETUR: 'QID',
+      RETURNS_CLAIMS: 'ClaimID',
+      OUTBOUND_ORDERS: 'OrderID',
+      DISPATCH_MANIFEST: 'ManifestID',
+      STOCK_OPNAME: 'SO_ID'
+    };
+    var idField = idFields[module] || 'ID';
+    var rows = [];
+    var cacheMap = {
+      INBOUND_RECEIVING: App.cache.inboundReceiving,
+      QUARANTINE_RETUR: App.cache.quarantine,
+      RETURNS_CLAIMS: App.cache.claims,
+      OUTBOUND_ORDERS: App.cache.outboundOrders,
+      DISPATCH_MANIFEST: App.cache.dispatchManifest,
+      STOCK_OPNAME: App.cache.soHeader
+    };
+    rows = cacheMap[module] || [];
+    var row = null;
+    for (var i = 0; i < rows.length; i++) {
+      if (String(rows[i][idField] || '') === String(id)) { row = rows[i]; break; }
+    }
+
+    var confirmedBy = App.user ? (App.user.NamaLengkap || App.user.Username) : '';
+
+    if (module === 'INBOUND_RECEIVING') {
+      Swal.fire({
+        icon: 'question',
+        title: 'Konfirmasi Penerimaan Inbound?',
+        text: 'Aksi <strong>' + esc(id) + '</strong> akan diproses. Anda yakin ingin melanjutkan?',
+        showCancelButton: true,
+        showDenyButton: true,
+        confirmButtonText: 'Konfirmasi',
+        denyButtonText: 'Tolak',
+        denyButtonColor: '#DC2626',
+        cancelButtonText: 'Batal'
+      }).then(function (answer) {
+        if (!answer || !answer.isConfirmed) { return; }
+        var action = answer.isDenied ? 'REJECT' : 'CONFIRM';
+        return withLoading(callApi('confirmInboundReceiving', { rcvID: id, action: action, confirmedBy: confirmedBy }), action === 'CONFIRM' ? 'Mengecek receiving...' : 'Menolak receiving...');
+      }).catch(function (err) { showError(err, 'Konfirmasi Receiving Gagal'); });
+      return;
+    }
+
+    if (module === 'QUARANTINE_RETUR') {
+      Swal.fire({
+        title: 'Ubah Disposisi Karantina?',
+        icon: 'question',
+        input: 'select',
+        inputOptions: {
+          RETUR: 'Retur ke Supplier',
+          REPLACEMENT: 'Penggantian',
+          AFKIR: 'Afkir'
+        },
+        inputPlaceholder: 'Pilih disposisi',
+        showCancelButton: true,
+        confirmButtonText: 'Simpan',
+        cancelButtonText: 'Batal'
+      }).then(function (answer) {
+        if (!answer || !answer.isConfirmed) { return; }
+        return withLoading(callApi('confirmQuarantineDisposition', { qid: id, disposition: answer.value, action: 'CONFIRM', confirmedBy: confirmedBy }), 'Menyimpan disposisi...');
+      }).catch(function (err) { showError(err, 'Disposisi Karantina Gagal'); });
+      return;
+    }
+
+    if (module === 'RETURNS_CLAIMS') {
+      Swal.fire({
+        icon: 'question',
+        title: 'Konfirmasi Tindakan Klaim Return?',
+        text: 'Aksi untuk claim <strong>' + esc(id) + '</strong> akan diproses.',
+        showCancelButton: true,
+        showDenyButton: true,
+        confirmButtonText: 'Konfirmasi',
+        denyButtonText: 'Tolak',
+        denyButtonColor: '#DC2626',
+        cancelButtonText: 'Batal'
+      }).then(function (answer) {
+        if (!answer || !answer.isConfirmed) { return; }
+        var actionDisposition = actionButton.getAttribute('data-disposition') || 'RETUR';
+        var action = answer.isDenied ? 'REJECT' : 'CONFIRM';
+        return withLoading(callApi('confirmReturnClaim', { claimID: id, actionDisposition: actionDisposition, action: action, confirmedBy: confirmedBy }), 'Memproses klaim return...');
+      }).catch(function (err) { showError(err, 'Konfirmasi Klaim Return Gagal'); });
+      return;
+    }
+
+    if (module === 'OUTBOUND_ORDERS') {
+      Swal.fire({
+        icon: 'question',
+        title: 'Konfirmasi Outbound / Pengiriman?',
+        text: 'Konfirmasi <strong>' + esc(id) + '</strong> akan disimpan ke OUTBOUND_CONFIRMATIONS.',
+        showCancelButton: true,
+        confirmButtonText: 'Konfirmasi',
+        cancelButtonText: 'Batal'
+      }).then(function (answer) {
+        if (!answer || !answer.isConfirmed) { return; }
+        return withLoading(callApi('submitOutboundConfirmation', {
+          orderID: id,
+          noPO: actionButton.getAttribute('data-nopo') || '',
+          type: actionButton.getAttribute('data-type') || 'ORDER',
+          picName: actionButton.getAttribute('data-pic') || confirmedBy,
+          notes: actionButton.getAttribute('data-notes') || '',
+          source: 'Web',
+          confirm: true
+        }), 'Menyimpan konfirmasi outbound...');
+      }).catch(function (err) { showError(err, 'Konfirmasi Outbound Gagal'); });
+      return;
+    }
+
+    if (module === 'DISPATCH_MANIFEST') {
+      Swal.fire({
+        icon: 'question',
+        title: 'Konfirmasi Status Pengiriman?',
+        text: 'Status pengiriman <strong>' + esc(id) + '</strong> akan diperbarui.',
+        input: 'select',
+        inputOptions: { SHIPPED: 'Dikirim (SHIPPED)', DELIVERED: 'Terkonfirmasi Terkirim (DELIVERED)' },
+        inputValue: statusShipment || 'SHIPPED',
+        showCancelButton: true,
+        confirmButtonText: 'Simpan',
+        cancelButtonText: 'Batal'
+      }).then(function (answer) {
+        if (!answer || !answer.isConfirmed) { return; }
+        return withLoading(callApi('confirmManifestShipment', { manifestID: id, statusShipment: answer.value, action: 'CONFIRM', confirmedBy: confirmedBy }), 'Memperbarui status pengiriman...');
+      }).then(function (result) {
+        if (result && result.statusShipment) {
+          toast('success', 'Status Pengiriman Diperbarui', 'Manifest ' + id + ' -> ' + result.statusShipment + '.');
+          App.cache.dispatchManifest = null;
+          loadDispatchManifest(true);
+        }
+      }).catch(function (err) { showError(err, 'Konfirmasi Pengiriman Gagal'); });
+      return;
+    }
+
+    if (module === 'STOCK_OPNAME') {
+      Swal.fire({
+        icon: 'question',
+        title: 'Konfirmasi Stock Opname (BASO)?',
+        text: 'SO <strong>' + esc(id) + '</strong> akan diproses.',
+        showCancelButton: true,
+        confirmButtonText: 'Konfirmasi',
+        cancelButtonText: 'Batal'
+      }).then(function (answer) {
+        if (!answer || !answer.isConfirmed) { return; }
+        return withLoading(callApi('approveBASO', { soId: id, approvedBy: confirmedBy, reason: 'Konfirmasi BASO ' + id }), 'Menyetujui stock opname...');
+      }).then(function () {
+        App.cache.soHeader = null;
+        App.cache.stockLogs = null;
+        App.loaded.stockMonitor = false;
+        App.loaded.stockCard = false;
+        loadInitialAppData().catch(function () {});
+      }).catch(function (err) { showError(err, 'Konfirmasi Stock Opname Gagal'); });
+      return;
+    }
+  }
+
+  function detailItem(label, value) {
+    return '<div class="detail-item"><small>' + esc(label) + '</small><strong>' +
+      esc(value === null || value === undefined || value === '' ? '-' : value) + '</strong></div>';
+  }
+
+  function openInboundDetail(rcvID) {
+    withLoading(callApi('getInboundDetail', { rcvID: rcvID }), 'Memuat detail receiving...')
+      .then(function (detail) {
+        var receiving = detail.receiving || {};
+        var detailRows = detail.details || [];
+        var quarantine = detail.quarantine || [];
+        var body =
+          '<div class="detail-grid mb-3">' +
+          detailItem('RCV ID', receiving.RcvID) +
+          detailItem('No Surat Jalan', receiving.NoSJ) +
+          detailItem('Supplier', receiving.SupplierName || receiving.SupplierID) +
+          detailItem('Lokasi', receiving.LokasiID) +
+          detailItem('Tanggal', receiving.TanggalDatang) +
+          detailItem('Status QC', receiving.StatusQC) +
+          '</div>' +
+          '<div class="section-label"><span>Detail Barang</span><span>' + detailRows.length + ' baris</span></div>' +
+          '<div class="table-responsive"><table class="table modal-table align-middle"><thead><tr><th>SKU</th><th>Barang</th><th>Lokasi</th><th class="text-end">Diterima</th><th class="text-end">Baik</th><th class="text-end">Cacat</th><th>Status QC</th></tr></thead><tbody>' +
+          (detailRows.length ? detailRows.map(function (row) {
+            return '<tr><td class="cell-strong">' + esc(row.SKU) + '</td><td>' + esc(row.NamaBarang) + '</td><td>' + esc(row.LokasiID || row.LocationID || '-') + '</td><td class="text-end">' + fmtNum(row.QtyDiterima) + '</td><td class="text-end">' + fmtNum(row.QtyBaik) + '</td><td class="text-end">' + fmtNum(row.QtyCacat) + '</td><td>' + statusBadge(row.StatusQC) + '</td></tr>';
+          }).join('') : emptyRow(7, 'Tidak ada detail.')) +
+          '</tbody></table></div>' +
+          (quarantine.length ? (
+            '<div class="section-label mt-3"><span>Quarantine (' + quarantine.length + ' baris)</span></div>' +
+            '<div class="table-responsive"><table class="table modal-table align-middle"><thead><tr><th>QID</th><th>SKU</th><th class="text-end">Qty</th><th>Alasan</th><th>Disposition</th><th>Status</th></tr></thead><tbody>' +
+            quarantine.map(function (row) {
+              return '<tr><td>' + esc(row.QID) + '</td><td>' + esc(row.SKU) + '</td><td class="text-end">' + fmtNum(row.QtyCacat) + '</td><td>' + esc(row.Reason || '-') + '</td><td>' + esc(row.Disposition || '-') + '</td><td>' + statusBadge(row.Status) + '</td></tr>';
+            }).join('') +
+            '</tbody></table></div>'
+          ) : '');
+
+        openDrawer('Detail Receiving ' + esc(rcvID), body,
+          '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Tutup</button>',
+          'modal-xl');
+      })
+      .catch(function (err) { showError(err, 'Gagal Memuat Detail'); });
+  }
+
+  function openQuarantineDisposition(qid) {
+    Swal.fire({
+      title: 'Ubah Disposisi Karantina?',
+      text: 'Pilih tindakan untuk QID ' + qid + '.',
+      input: 'select',
+      inputOptions: {
+        'RETUR': 'Retur ke Supplier',
+        'REPLACEMENT': 'Penggantian',
+        'AFKIR': 'Afkir'
+      },
+      inputPlaceholder: 'Pilih disposisi',
+      showCancelButton: true,
+      confirmButtonText: 'Simpan',
+      cancelButtonText: 'Batal'
+    }).then(function (answer) {
+      if (!answer.isConfirmed) {
+        return;
+      }
+      var disposition = answer.value;
+      withLoading(callApi('processQuarantineDisposition', { qid: qid, disposition: disposition }), 'Menyimpan disposisi...')
+        .then(function (result) {
+          toast('success', 'Disposisi tersimpan', 'QID ' + qid + ' diubah menjadi ' + result.status + '.');
+          App.cache.quarantine = null;
+          loadQuarantine(true);
+        })
+        .catch(function (err) { showError(err, 'Disposisi Gagal'); });
+    });
+  }
+
+  function openOutboundStatus(orderID, currentStatus) {
+    var current = String(currentStatus || '').toUpperCase();
+    var OUTBOUND_TRANSITIONS = {
+      CONFIRMED: ['PICKING', 'CANCELLED'],
+      PICKING: ['CHECKING', 'CANCELLED'],
+      CHECKING: ['PACKED', 'CANCELLED'],
+      PACKED: ['DISPATCHED', 'CANCELLED'],
+      DISPATCHED: ['COMPLETED'],
+      COMPLETED: [],
+      CANCELLED: []
+    };
+    var nextStatuses = OUTBOUND_TRANSITIONS[current] || [];
+    if (!nextStatuses.length) {
+      Swal.fire({
+        icon: 'info',
+        title: 'Status Final',
+        text: 'Order ' + orderID + ' sudah berstatus ' + current + ' dan tidak memiliki transisi berikutnya.',
+        confirmButtonText: 'Tutup'
+      });
+      return;
+    }
+
+    var options = nextStatuses.map(function (status) {
+      return '<option value="' + status + '">' + status + '</option>';
+    }).join('');
+
+    var body =
+      '<form id="status-form">' +
+      '<div class="alert alert-light border mb-3"><strong>' + esc(orderID) + '</strong><br><span class="text-muted small">Status saat ini: ' + esc(current) + '</span></div>' +
+      '<label class="form-label">Status Baru</label>' +
+      '<select class="form-select" name="newStatus" required>' + options + '</select>' +
+      '<div id="dispatch-fields" class="d-none mt-3">' +
+      '<div class="row g-2">' +
+      '<div class="col-md-4"><label class="form-label">Ekspedisi</label><input type="text" class="form-control" name="ekspedisi" placeholder="Contoh: JNE"></div>' +
+      '<div class="col-md-4"><label class="form-label">No Resi / AWB</label><input type="text" class="form-control" name="noResi" placeholder="Opsional"></div>' +
+      '<div class="col-md-4"><label class="form-label">Driver</label><input type="text" class="form-control" name="driverName" placeholder="Nama driver"></div>' +
+      '</div>' +
+      '</div>' +
+      '</form>';
+
+    openDrawer('Update Status Order ' + esc(orderID), body,
+      '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>' +
+      '<button type="submit" form="status-form" class="btn btn-primary"><i class="fa-solid fa-check"></i> Update Status</button>',
+      'modal-lg');
+
+    var drawerRoot = q('#app-drawer-modal') || document;
+    var statusSelect = q('#status-form', drawerRoot);
+    statusSelect = statusSelect ? statusSelect.querySelector('select[name="newStatus"]') : null;
+    var dispatchFields = q('#dispatch-fields', drawerRoot);
+
+    if (statusSelect && dispatchFields) {
+      var toggleDispatch = function () {
+        dispatchFields.classList.toggle('d-none', statusSelect.value !== 'DISPATCHED');
+      };
+      safeBind(statusSelect, 'change', toggleDispatch);
+      toggleDispatch();
+    }
+
+    safeBind(q('#status-form', drawerRoot), 'submit', function (event) {
+      event.preventDefault();
+      var form = event.target;
+      var target = form.elements.newStatus.value;
+      var payload = {
+        orderId: orderID,
+        newStatus: target,
+        ekspedisi: form.elements.ekspedisi ? form.elements.ekspedisi.value : '',
+        noResi: form.elements.noResi ? form.elements.noResi.value : '',
+        driverName: form.elements.driverName ? form.elements.driverName.value : ''
+      };
+
+      withLoading(callApi('updateOrderStatus', payload), 'Memperbarui status...')
+        .then(function (result) {
+          var _closeBtn = q('#app-drawer-modal .modal .btn-close'); if (_closeBtn) { _closeBtn.click(); }
+          toast('success', 'Status diperbarui', orderID + ' -> ' + result.statusOrder + '.');
+          App.cache.outboundOrders = null;
+          App.cache.dispatchManifest = null;
+          loadOutboundOrders(true);
+          loadInitialAppData().catch(function () {});
+        })
+        .catch(function (err) { showError(err, 'Update Status Gagal'); });
+    });
+  }
+
+  function loadAdjustmentLogs(force) {
+    var tbody = q('#adjustment-logs-body');
+    if (!tbody) {
+      return;
+    }
+    setTableLoading(tbody, 9, 'Memuat riwayat adjustment...');
+    return callApi('getLazyLoadData', {
+      table: 'STOCK_LOGS',
+      page: 1,
+      limit: 500,
+      search: '',
+      filters: { Tipe: ['ADJUST', 'TRANSFER'], sortDir: 'desc' }
+    }).then(function (result) {
+      var rows = result.rows || [];
+      if (!rows.length) {
+        tbody.innerHTML = emptyRow(9, 'Belum ada adjustment atau transfer.');
+      } else {
+        tbody.innerHTML = rows.map(function (row) {
+          return '<tr>' +
+            '<td class="cell-muted">' + esc(shortDate(row.Timestamp)) + '</td>' +
+            '<td class="cell-strong">' + esc(row.SKU) + '</td>' +
+            '<td>' + esc(row.NamaBarang || '-') + '</td>' +
+            '<td>' + statusBadge(row.Tipe) + '</td>' +
+            '<td class="text-end">' + (Number(row.QtyMasuk) ? qtyCell(row.QtyMasuk) : '<span class="qty-zero">0</span>') + '</td>' +
+            '<td class="text-end">' + (Number(row.QtyKeluar) ? qtyCell(-Math.abs(Number(row.QtyKeluar))) : '<span class="qty-zero">0</span>') + '</td>' +
+            '<td class="text-end"><strong>' + fmtNum(row.SaldoAkhir) + '</strong></td>' +
+            '<td class="cell-muted">' + esc(row.RefDoc || '-') + '</td>' +
+            '<td class="cell-muted">' + esc(row.User || '-') + '</td>' +
+            '</tr>';
+        }).join('');
+      }
+    }).catch(function (err) {
+      tbody.innerHTML = emptyRow(9, 'Gagal memuat: ' + err.message);
+    });
+  }
+
+  /* ====================================================================== */
+  /* SYNC / AUTO                                                            */
+  /* ====================================================================== */
+
+  function runSync(force) {
+    if (App.autoSyncBusy) {
+      toast('info', 'Sinkronisasi berjalan', 'Mohon tunggu proses sinkronisasi sebelumnya selesai.');
+      return Promise.resolve(null);
+    }
+    App.autoSyncBusy = true;
+    showLoading(force ? 'Force sync data logs...' : 'Menyinkronkan data logs...');
+
+    return callApi('syncAllLogsAndRecalculateStock', {
+      force: !!force,
+      triggeredBy: force ? 'MANUAL_FORCE' : 'MANUAL'
+    })
+      .then(function (result) {
+        hideLoading();
+        if (result && result.skipped) {
+          toast('info', 'Sync dilewati', result.reason || 'Sinkronisasi masih dalam interval.');
+        } else {
+          toast(
+            'success',
+            'Sinkronisasi selesai',
+            (result.logsCreated || 0) + ' log baru, ' + (result.skuRecalculated || 0) + ' SKU dihitung ulang.'
+          );
+        }
+        // Invalidate caches so next tab open fetches fresh data.
+        App.cache.stockLogs = null;
+        App.cache.inboundReceiving = null;
+        App.cache.outboundOrders = null;
+        App.cache.pickingList = null;
+        App.cache.dispatchManifest = null;
+        App.cache.soHeader = null;
+        App.cache.soDetail = null;
+        App.loaded.stockMonitor = false;
+        App.loaded.stockCard = false;
+        App.loaded.opname = false;
+        loadInitialAppData().catch(function () {});
+        if (App.activeView === 'inventory') {
+          if (App.invTab === 'logs') {
+            loadStockCard();
+          } else {
+            loadStockMonitoring(true);
+          }
+        } else if (App.activeView === 'sync') {
+          loadSync(true);
+        }
+      })
+      .catch(function (err) {
+        hideLoading();
+        showError(err, 'Sinkronisasi Gagal');
+      })
+      .then(function () {
+        App.autoSyncBusy = false;
+      });
+  }
+
+  function startAutoSync() {
+    if (App.autoSyncTimer) {
+      clearInterval(App.autoSyncTimer);
+    }
+    App.autoSyncTimer = setInterval(function () {
+      runAutoSync('AUTO_REFRESH');
+    }, 30 * 1000);
+    // Silent auto-sync default 30 detik untuk tab aktif.
+  }
+
+  function runAutoSync(triggerName) {
+    if (!App.token || App.autoSyncBusy) {
+      return;
+    }
+    App.autoSyncBusy = true;
+    callApi('syncAllLogsAndRecalculateStock', { triggeredBy: triggerName || 'AUTO_REFRESH' })
+      .then(function (result) {
+        if (result && !result.skipped) {
+          App.cache.stockLogs = null;
+          App.cache.inboundReceiving = null;
+          App.loaded.stockMonitor = false;
+          App.loaded.stockCard = false;
+          loadInitialAppData().catch(function () {});
+          if (App.activeView === 'inventory') {
+            if (App.invTab === 'logs') {
+              loadStockCard();
+            } else {
+              loadStockMonitoring(true);
+            }
+          }
+        }
+      })
+      .then(function () {
+        App.autoSyncBusy = false;
+      })
+      .catch(function () {
+        App.autoSyncBusy = false;
+      });
+  }
+
+  function startPing() {
+    if (App.pingTimer) {
+      clearInterval(App.pingTimer);
+    }
+    App.pingTimer = setInterval(function () {
+      callApi('ping').then(function (data) {
+        setServerStatus('online', 'Server Online', data.serverTime);
+      }).catch(function () {
+        setServerStatus('offline', 'Server Offline', '');
+      });
+    }, 60000);
+  }
+
+  /* ====================================================================== */
+  /* BOOT                                                                   */
+  /* ====================================================================== */
+
+  function boot() {
+    try {
+      setText('#sidebar-version', App.version);
+      bindAuthEvents();
+
+      var restored = restoreLogin();
+      if (!restored) {
+        showLoginScreen('');
+        var username = q('#login-username');
+        if (username) {
+          setTimeout(function () {
+            try {
+              username.focus();
+            } catch (err) {
+              // Focus is best-effort.
+            }
+          }, 120);
+        }
+      }
+    } catch (err) {
+      console.error('Boot error:', err);
+      // Paksa tampilan login screen meski boot gagal, jangan biarkan blank.
+      try {
+        document.body.classList.add('auth-mode');
+        var root = q('#app-root');
+        if (root) {
+          root.classList.remove('app-visible');
+        }
+        var screen = q('#login-screen');
+        if (screen) {
+          screen.classList.remove('is-leaving');
+          screen.style.display = 'flex';
+        }
+        showLoginError('Gagal memuat aplikasi: ' + (err && err.message ? err.message : String(err)));
+      } catch (err2) {
+        console.error('Boot fallback error:', err2);
+      }
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () {
+      try {
+        boot();
+      } catch (err) {
+        console.error('DOMContentLoaded boot error:', err);
+        try {
+          document.body.classList.add('auth-mode');
+          var screen = document.querySelector('#login-screen');
+          if (screen) {
+            screen.style.display = 'flex';
+            screen.classList.remove('is-leaving');
+          }
+          var root = document.querySelector('#app-root');
+          if (root) {
+            root.classList.remove('app-visible');
+          }
+        } catch (err2) {
+          console.error('DOMContentLoaded fallback error:', err2);
+        }
+      }
+    });
+  } else {
+    try {
+      boot();
+    } catch (err) {
+      console.error('Immediate boot error:', err);
+      try {
+        document.body.classList.add('auth-mode');
+        var screen = document.querySelector('#login-screen');
+        if (screen) {
+          screen.style.display = 'flex';
+          screen.classList.remove('is-leaving');
+        }
+        var root = document.querySelector('#app-root');
+        if (root) {
+          root.classList.remove('app-visible');
+        }
+      } catch (err2) {
+        console.error('Immediate boot fallback error:', err2);
+      }
+    }
+  }
+
+  // Expose inti UI ke global scope agar fallback login di Index.html dapat
+  // memanggil enterApp() langsung tanpa reload halaman.
+  window.enterApp = enterApp;
+  window.wmsShowView = showView;
+  window.wmsApp = App;
+})();
+</script>

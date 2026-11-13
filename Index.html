@@ -1,0 +1,1312 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WMS PT GEA</title>
+  <link rel="icon" href="<?= logoUrl ?>">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.min.css" rel="stylesheet">
+  <?!= include('Styles') ?>
+</head>
+<body class="auth-mode"
+  data-initial-view="<?= initialView ?>"
+  data-app-version="<?= appVersion ?>"
+  data-logo-url="<?= logoUrl ?>"
+  data-user-email="<?= escapeHtml_(userEmail) ?>"
+  data-init-error="<?= escapeHtml_(initError) ?>">
+
+  <!-- Debug banner: tampilkan pesan error merah jika ada error JS. -->
+  <div id="wms-error-banner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:99999;background:#DC2626;color:#fff;font-size:0.75rem;padding:8px 12px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+    <span id="wms-error-msg"></span>
+    <button onclick="document.getElementById('wms-error-banner').style.display='none'" style="float:right;background:none;border:none;color:#fff;font-size:1.2rem;font-weight:bold;cursor:pointer;">&times;</button>
+  </div>
+
+  <!-- Login screen fallback: paksa tampil jika JS gagal. -->
+  <div id="login-screen" class="login-screen">
+    <div class="login-shell">
+      <section class="login-brand-panel">
+        <div class="login-brand-top">
+          <img src="<?= logoUrl ?>" alt="Logo PT GEA" class="login-logo">
+          <div>
+            <div class="login-brand-name">PT <span>GEA</span></div>
+            <div class="login-brand-sub">Warehouse Management System</div>
+          </div>
+        </div>
+
+        <div class="login-hero-copy">
+          <h1>Kendali penuh atas <em>stok gudang</em> Anda.</h1>
+          <p>
+            Monitoring saldo stok, kartu stok, inbound, outbound, dan stock opname
+            dalam satu platform terintegrasi. Data disinkronkan otomatis dari sumber
+            AppSheet dan spreadsheet operasional.
+          </p>
+        </div>
+
+        <div class="login-feature-list">
+          <div class="login-feature"><i class="fa-solid fa-boxes-stacked"></i><span>Monitoring Stok Real-time</span></div>
+          <div class="login-feature"><i class="fa-solid fa-rotate"></i><span>Auto Sync Inkremental</span></div>
+          <div class="login-feature"><i class="fa-solid fa-shield-halved"></i><span>Akses ADMIN / STAFF</span></div>
+          <div class="login-feature"><i class="fa-solid fa-clock-rotate-left"></i><span>Kartu Stok Lengkap</span></div>
+        </div>
+      </section>
+
+      <section class="login-form-panel">
+        <h2>Selamat Datang</h2>
+        <p class="login-lead">Masuk menggunakan akun WMS PT GEA Anda.</p>
+
+        <div class="login-error" id="login-error" role="alert"></div>
+
+        <form id="login-form" autocomplete="on" novalidate onsubmit="event.preventDefault(); submitLogin(); return false;">
+          <div class="login-field">
+            <label class="form-label" for="login-username">Username</label>
+            <div class="login-input-wrap">
+              <i class="fa-solid fa-user input-icon"></i>
+              <input type="text" class="form-control" id="login-username" name="username"
+                placeholder="Masukkan username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+            </div>
+          </div>
+
+          <div class="login-field">
+            <label class="form-label" for="login-password">Password</label>
+            <div class="login-input-wrap">
+              <i class="fa-solid fa-lock input-icon"></i>
+              <input type="password" class="form-control" id="login-password" name="password"
+                placeholder="Masukkan password" autocomplete="current-password" required>
+              <button type="button" class="password-toggle" id="login-password-toggle" aria-label="Tampilkan password">
+                <i class="fa-regular fa-eye"></i>
+              </button>
+            </div>
+          </div>
+
+          <div class="login-options">
+            <div class="form-check m-0">
+              <input class="form-check-input" type="checkbox" id="login-remember" checked>
+              <label class="form-check-label" for="login-remember">Ingat Saya</label>
+            </div>
+            <span><i class="fa-solid fa-lock me-1"></i>Akses terenkripsi</span>
+          </div>
+
+          <button type="button" class="btn btn-success login-submit" id="login-submit" onclick="submitLogin()">
+            <i class="fa-solid fa-right-to-bracket me-2"></i><span id="login-submit-text">Masuk ke Dashboard</span>
+          </button>
+        </form>
+
+        <div class="login-hints">
+          <span>Akun default ADMIN: <strong>admin / admin123</strong></span>
+          <span>Akun default STAFF: <strong>staff / staff123</strong></span>
+          <span>Segera ubah password default melalui menu Users &amp; Sync Logs.</span>
+        </div>
+
+        <div class="login-footer-note">
+          &copy; <span id="login-year">2026</span> PT GEA &middot; Warehouse Management System v<?= appVersion ?>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- APPLICATION ROOT                                                      -->
+  <!-- ===================================================================== -->
+  <div id="app-root" class="app-root">
+
+    <nav class="navbar app-navbar sticky-top">
+      <div class="container-fluid">
+        <div class="d-flex align-items-center gap-2">
+          <button class="btn btn-navbar-icon d-lg-none" id="sidebar-toggle" type="button" aria-label="Buka menu">
+            <i class="fa-solid fa-bars"></i>
+          </button>
+          <a class="navbar-brand d-flex align-items-center gap-2" href="#" data-view="dashboard">
+            <img src="<?= logoUrl ?>" alt="Logo PT GEA" class="brand-logo">
+            <span class="brand-copy">
+              <span class="brand-title">WMS <span class="brand-accent">PT GEA</span></span>
+              <span class="brand-subtitle">Warehouse Management System</span>
+            </span>
+          </a>
+        </div>
+
+        <div class="d-flex align-items-center gap-2 gap-md-3 ms-auto">
+          <div class="sync-indicator" id="sync-indicator" title="Status sinkronisasi otomatis">
+            <span class="sync-dot"></span>
+            <span>
+              <strong id="sync-indicator-text">Auto Sync</strong>
+              <small id="sync-indicator-time">Menghubungkan...</small>
+            </span>
+          </div>
+
+          <div class="server-status" id="server-status" title="Status server real-time">
+            <span class="status-dot" id="server-status-dot"></span>
+            <span class="status-copy">
+              <span class="status-label" id="server-status-text">Menghubungkan...</span>
+              <small id="server-status-time">-</small>
+            </span>
+          </div>
+
+          <span class="role-chip role-staff" id="user-role-chip">
+            <i class="fa-solid fa-user-shield"></i><span id="user-role-chip-text">STAFF</span>
+          </span>
+
+          <div class="user-profile">
+            <div class="user-avatar" id="user-avatar">G</div>
+            <div class="user-copy d-none d-md-block">
+              <strong id="user-name">PT GEA</strong>
+              <small id="user-role">Staff Gudang</small>
+            </div>
+          </div>
+
+          <button type="button" class="btn logout-btn" id="btn-logout" title="Keluar dari aplikasi">
+            <i class="fa-solid fa-right-from-bracket"></i>
+            <span class="d-none d-lg-inline ms-1">Keluar</span>
+          </button>
+        </div>
+      </div>
+    </nav>
+
+    <div class="app-shell">
+      <aside class="app-sidebar" id="app-sidebar">
+        <div class="sidebar-heading">Menu Utama</div>
+        <nav class="sidebar-nav">
+          <a href="#" class="sidebar-link" data-view="dashboard" data-permission="dashboard">
+            <i class="fa-solid fa-gauge-high"></i><span>Dashboard</span>
+          </a>
+          <a href="#" class="sidebar-link" data-view="inventory" data-permission="stock-monitor">
+            <i class="fa-solid fa-boxes-stacked"></i><span>Inventory &amp; Kartu Stok</span>
+          </a>
+          <a href="#" class="sidebar-link" data-view="inbound" data-permission="inbound">
+            <i class="fa-solid fa-truck-ramp-box"></i><span>Inbound &amp; Retur</span>
+          </a>
+          <a href="#" class="sidebar-link" data-view="outbound" data-permission="order-status">
+            <i class="fa-solid fa-cart-flatbed"></i><span>Outbound &amp; Pengiriman</span>
+          </a>
+          <a href="#" class="sidebar-link" data-view="opname" data-permission="opname">
+            <i class="fa-solid fa-clipboard-check"></i><span>Stock Opname (SO)</span>
+          </a>
+        </nav>
+
+        <div class="sidebar-heading" data-admin-only="true">Master &amp; Sistem</div>
+        <nav class="sidebar-nav" data-admin-only="true">
+          <a href="#" class="sidebar-link" data-view="master" data-permission="master">
+            <i class="fa-solid fa-database"></i><span>Master Data</span>
+          </a>
+          <a href="#" class="sidebar-link" data-view="users" data-permission="users">
+            <i class="fa-solid fa-users-gear"></i><span>Users &amp; Sync Logs</span>
+          </a>
+          <a href="#" class="sidebar-link" data-view="sync" data-permission="sync">
+            <i class="fa-solid fa-rotate"></i><span>Sinkronisasi</span>
+          </a>
+        </nav>
+
+        <div class="sidebar-heading">Utilitas</div>
+        <nav class="sidebar-nav">
+          <a href="#" class="sidebar-link" id="sidebar-refresh-all">
+            <i class="fa-solid fa-arrows-rotate"></i><span>Muat Ulang Data</span>
+          </a>
+          <a href="#" class="sidebar-link" id="btn-quick-sync" data-permission="sync">
+            <i class="fa-solid fa-cloud-arrow-down"></i><span>Sync Sekarang</span>
+          </a>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="sidebar-info">
+            <span><i class="fa-solid fa-code-branch"></i> Versi <span id="sidebar-version"><?= appVersion ?></span></span>
+            <span><i class="fa-regular fa-clock"></i> <?= timezone ?></span>
+          </div>
+          <a href="#" class="sidebar-sheet-link" id="sidebar-sheet-link" target="_blank" rel="noopener">
+            <i class="fa-solid fa-table-columns"></i>
+            <span id="sidebar-sheet-name">Spreadsheet WMS</span>
+          </a>
+        </div>
+      </aside>
+
+      <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+      <main class="app-main">
+        <div class="page-heading">
+          <div>
+            <h1 id="page-title">Dashboard</h1>
+            <p id="page-subtitle">Ringkasan operasional gudang PT GEA</p>
+          </div>
+          <div class="page-heading-meta">
+            <span id="last-sync">Belum disinkronkan</span>
+            <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-page" type="button">
+              <i class="fa-solid fa-rotate-right"></i><span class="d-none d-sm-inline ms-1">Refresh</span>
+            </button>
+            <button class="btn btn-outline-success btn-sm ms-2" id="btn-sync-manual" type="button" data-permission="sync">
+              <i class="fa-solid fa-cloud-arrow-down"></i><span class="d-none d-sm-inline ms-1">Sync Manual</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- ====================== DASHBOARD ====================== -->
+        <section id="view-dashboard" class="app-view active">
+          <div class="row g-3">
+            <div class="col-6 col-xl-3">
+              <div class="card stat-card">
+                <div class="stat-icon stat-icon-navy"><i class="fa-solid fa-boxes-stacked"></i></div>
+                <div class="stat-body">
+                  <span class="stat-label">Total SKU Aktif</span>
+                  <strong class="stat-value" id="stat-total-sku">-</strong>
+                  <small class="stat-note" id="stat-total-sku-note">Master items</small>
+                </div>
+              </div>
+            </div>
+            <div class="col-6 col-xl-3">
+              <div class="card stat-card">
+                <div class="stat-icon stat-icon-amber"><i class="fa-solid fa-truck-ramp-box"></i></div>
+                <div class="stat-body">
+                  <span class="stat-label">Inbound Hari Ini</span>
+                  <strong class="stat-value" id="stat-inbound-today">-</strong>
+                  <small class="stat-note" id="stat-inbound-note">Penerimaan AppSheet</small>
+                </div>
+              </div>
+            </div>
+            <div class="col-6 col-xl-3">
+              <div class="card stat-card">
+                <div class="stat-icon stat-icon-green"><i class="fa-solid fa-cart-flatbed"></i></div>
+                <div class="stat-body">
+                  <span class="stat-label">Outbound Aktif</span>
+                  <strong class="stat-value" id="stat-outbound-active">-</strong>
+                  <small class="stat-note" id="stat-outbound-note">Order belum selesai</small>
+                </div>
+              </div>
+            </div>
+            <div class="col-6 col-xl-3">
+              <div class="card stat-card">
+                <div class="stat-icon stat-icon-red"><i class="fa-solid fa-triangle-exclamation"></i></div>
+                <div class="stat-body">
+                  <span class="stat-label">Status Sync</span>
+                  <strong class="stat-value stat-value-sm" id="stat-sync-status">-</strong>
+                  <small class="stat-note" id="stat-sync-note">Terakhir sinkron</small>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="row g-3 mt-3">
+            <div class="col-xl-6">
+              <div class="card app-card h-100">
+                <div class="card-header app-card-header">
+                  <div>
+                    <h6><i class="fa-solid fa-triangle-exclamation me-2"></i>Stok Kritis (EMPTY / LOW)</h6>
+                    <small>SKU yang perlu perhatian segera</small>
+                  </div>
+                </div>
+                <div class="table-responsive">
+                  <table class="table app-table align-middle mb-0">
+                    <thead>
+                      <tr>
+                        <th style="width:14%;">SKU</th>
+                        <th style="width:30%;">Nama Barang</th>
+                        <th style="width:16%;">Lokasi / Zone</th>
+                        <th class="text-end" style="width:14%;">Saldo Akhir</th>
+                        <th style="width:14%;">Status</th>
+                        <th class="text-end" style="width:12%;">Aksi</th>
+                      </tr>
+                    </thead>
+                    <tbody id="dashboard-critical-body">
+                      <tr><td colspan="6" class="empty-state">Memuat data stok kritis...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+            <div class="col-xl-6">
+              <div class="card app-card h-100">
+                <div class="card-header app-card-header">
+                  <div>
+                    <h6><i class="fa-solid fa-cart-flatbed me-2"></i>Antrean Outbound Aktif</h6>
+                    <small>Order yang belum diselesaikan</small>
+                  </div>
+                </div>
+                <div class="table-responsive">
+                  <table class="table app-table align-middle mb-0">
+                    <thead>
+                      <tr>
+                        <th style="width:14%;">Order ID</th>
+                        <th style="width:20%;">No PO</th>
+                        <th style="width:22%;">Outlet</th>
+                        <th style="width:16%;">Tanggal</th>
+                        <th style="width:16%;">Status</th>
+                        <th class="text-end" style="width:12%;">Aksi</th>
+                      </tr>
+                    </thead>
+                    <tbody id="dashboard-outbound-body">
+                      <tr><td colspan="6" class="empty-state">Memuat data outbound...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================== INVENTORY & KARTU STOK ================== -->
+        <section id="view-inventory" class="app-view">
+          <div class="module-tabs">
+            <button class="module-tab active" type="button" data-inv-tab="balance">
+              <i class="fa-solid fa-layer-group"></i> Monitoring Stok
+            </button>
+            <button class="module-tab" type="button" data-inv-tab="logs">
+              <i class="fa-solid fa-clock-rotate-left"></i> Kartu Stok
+            </button>
+          </div>
+
+          <!-- Monitoring Stok -->
+          <div class="module-panel active" id="inventory-balance-panel">
+            <div class="card app-card">
+              <div class="card-body">
+                <div class="control-bar">
+                  <div class="control-group">
+                    <label class="control-label">Kategori</label>
+                    <select class="form-select control-select" id="stock-monitor-kategori">
+                      <option value="">Semua Kategori</option>
+                      <option value="(blank)">Tanpa Kategori</option>
+                    </select>
+                  </div>
+                  <div class="control-group control-search flex-1">
+                    <label class="control-label">Produk / SKU</label>
+                    <div class="search-box" style="max-width:none; flex:1 1 0;">
+                      <i class="fa-solid fa-magnifying-glass"></i>
+                      <input type="search" class="form-control" id="stock-monitor-produk" placeholder="Cari SKU atau nama barang...">
+                    </div>
+                  </div>
+                  <div class="control-group">
+                    <label class="control-label">Status Stok</label>
+                    <div class="status-chips" id="stock-monitor-status-chips"></div>
+                  </div>
+                  <div class="control-actions">
+                    <button type="button" class="btn btn-primary btn-sm" id="stock-monitor-input-new" data-action="quick-create" data-module="INVENTORY">
+                      <i class="fa-solid fa-plus me-1"></i> Input Baru
+                    </button>
+                    <button type="button" class="btn btn-outline-secondary btn-sm" id="stock-monitor-sync">
+                      <i class="fa-solid fa-rotate me-1"></i> Sync
+                    </button>
+                    <button type="button" class="btn btn-outline-secondary btn-sm" id="stock-monitor-reset">
+                      <i class="fa-solid fa-rotate-left me-1"></i> Reset
+                    </button>
+                    <button type="button" class="btn btn-success btn-sm" id="stock-monitor-export">
+                      <i class="fa-solid fa-download me-1"></i> Export CSV
+                    </button>
+                  </div>
+                </div>
+
+                <div class="table-responsive">
+                  <table class="table app-table table-hover align-middle rolling-table monitor-table">
+                    <thead>
+                      <tr>
+                        <th class="text-start col-sku" style="width:12%;">SKU</th>
+                        <th class="text-start col-nama" style="width:26%;">Nama Produk</th>
+                        <th class="text-end col-saldo-awal" style="width:12%;">Saldo Awal</th>
+                        <th class="text-end col-saldo-masuk" style="width:10%;">Masuk</th>
+                        <th class="text-end col-saldo-keluar" style="width:10%;">Keluar</th>
+                        <th class="text-end col-saldo-akhir" style="width:14%;">Saldo Akhir</th>
+                        <th class="col-aksi text-center" style="width:12%;">Aksi</th>
+                      </tr>
+                    </thead>
+                    <tbody id="stock-monitor-body">
+                      <tr><td colspan="7" class="empty-state">Memuat saldo stok...</td></tr>
+                    </tbody>
+                    <tfoot id="stock-monitor-footer">
+                      <tr>
+                        <td colspan="2" class="text-start"><strong>Total (terfilter)</strong></td>
+                        <td class="text-end"></td>
+                        <td class="text-end"></td>
+                        <td class="text-end"></td>
+                        <td class="text-end"></td>
+                        <td class="col-aksi text-end"></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+                                <div class="table-pager" id="stock-monitor-pager"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Kartu Stok -->
+          <div class="module-panel" id="inventory-logs-panel">
+            <div class="card app-card">
+              <div class="card-body">
+                <div id="stock-card-summary-wrap" class="card-summary-wrap d-none mb-3">
+                  <div class="card app-card border-0 shadow-sm">
+                    <div class="card-body p-3">
+                      <div class="row g-3 align-items-center">
+                        <div class="col-md-3">
+                          <div class="card-summary-item">
+                            <div class="label">Nama Barang</div>
+                            <div class="value" id="card-nama-barang">-</div>
+                          </div>
+                        </div>
+                        <div class="col-md-2">
+                          <div class="card-summary-item">
+                            <div class="label">SKU</div>
+                            <div class="value sku-mono" id="card-sku">-</div>
+                          </div>
+                        </div>
+                        <div class="col-md-2">
+                          <div class="card-summary-item">
+                            <div class="label">Kategori</div>
+                            <div class="value" id="card-kategori">-</div>
+                          </div>
+                        </div>
+                        <div class="col-md-2">
+                          <div class="card-summary-item">
+                            <div class="label">Rak Default</div>
+                            <div class="value" id="card-rak">-</div>
+                          </div>
+                        </div>
+                        <div class="col-md-1">
+                          <div class="card-summary-item">
+                            <div class="label">Total Masuk</div>
+                            <div class="value qty-positive" id="card-total-masuk">0</div>
+                          </div>
+                        </div>
+                        <div class="col-md-1">
+                          <div class="card-summary-item">
+                            <div class="label">Total Keluar</div>
+                            <div class="value qty-negative" id="card-total-keluar">0</div>
+                          </div>
+                        </div>
+                        <div class="col-md-1">
+                          <div class="card-summary-item">
+                            <div class="label">Saldo Akhir</div>
+                            <div class="value cell-strong" id="card-saldo-akhir">0</div>
+                          </div>
+                        </div>
+                      </div>
+                      <div class="card-filter-controls mt-2 pt-2 border-top">
+                        <label class="control-label small">Filter Tanggal &amp; Tipe</label>
+                        <input type="date" class="form-control form-control-sm d-inline-block auto" id="card-start-date" style="width:130px;">
+                        <span class="small px-1">s.d.</span>
+                        <input type="date" class="form-control form-control-sm d-inline-block auto" id="card-end-date" style="width:130px;">
+                        <select class="form-select form-control-sm d-inline-block auto" id="card-tipe-filter" style="width:130px;">
+                          <option value="">Semua Tipe</option>
+                          <option value="IN">IN</option>
+                          <option value="OUT">OUT</option>
+                          <option value="ADJUST">ADJUST</option>
+                          <option value="TRANSFER">TRANSFER</option>
+                          <option value="OPNAME">OPNAME</option>
+                        </select>
+                        <button type="button" class="btn btn-outline-secondary btn-sm ms-2" id="card-refresh"><i class="fa-solid fa-rotate-right"></i></button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="toolbar mb-2" id="stock-card-toolbar" style="display:none;">
+                  <div class="search-box">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input type="search" class="form-control" id="stock-card-search" placeholder="Cari ref dokumen, lokasi, atau user...">
+                  </div>
+                  <button class="btn btn-outline-secondary ms-auto" type="button" id="stock-card-refresh">
+                    <i class="fa-solid fa-rotate-right"></i>
+                  </button>
+                </div>
+
+                <div class="table-responsive">
+                  <table class="table app-table table-hover align-middle rolling-table card-table">
+                    <thead>
+                      <tr>
+                        <th class="text-start col-waktu" style="width:14%;">Tanggal</th>
+                        <th class="text-start col-refdoc" style="width:20%;">No. Dokumen / Ref</th>
+                        <th class="text-center col-tipe" style="width:10%;">Tipe</th>
+                        <th class="text-end col-masuk" style="width:10%;">Masuk</th>
+                        <th class="text-end col-keluar" style="width:10%;">Keluar</th>
+                        <th class="text-end col-saldo-akhir" style="width:14%;">Saldo Akhir</th>
+                        <th class="text-start col-user" style="width:16%;">Aksi / User</th>
+                      </tr>
+                    </thead>
+                    <tbody id="stock-card-body">
+                      <tr><td colspan="7" class="empty-state">Pilih Produk/SKU dari Monitoring Stok untuk melihat kartu stok.</td></tr>
+                    </tbody>
+                                <div class="table-pager" id="stock-card-pager"></div>
+                <div id="stock-card-empty-hint" class="form-note mt-2" style="display:none;">
+                  Tidak ada mutasi stok pada filter yang dipilih.
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================== INBOUND & RETUR ================== -->
+        <section id="view-inbound" class="app-view">
+          <div class="module-tabs">
+            <button class="module-tab active" type="button" data-inbound-tab="receiving">
+              <i class="fa-solid fa-truck-ramp-box"></i> Penerimaan AppSheet
+            </button>
+            <button class="module-tab" type="button" data-inbound-tab="quarantine">
+              <i class="fa-solid fa-triangle-exclamation"></i> Karantina Cacat
+            </button>
+            <button class="module-tab" type="button" data-inbound-tab="claims">
+              <i class="fa-solid fa-receipt"></i> Klaim Retur
+            </button>
+          </div>
+
+          <div class="module-panel active" id="inbound-receiving-panel">
+            <div class="card app-card">
+              <div class="card-body">
+                <div class="toolbar">
+                  <div class="search-box">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input type="search" class="form-control" id="inbound-search" placeholder="Cari RCV, No SJ, supplier, SKU...">
+                  </div>
+                  <select class="form-select toolbar-select" id="inbound-status-filter">
+                    <option value="ALL">Semua Status QC</option>
+                    <option value="PASS">QC Pass</option>
+                    <option value="QUARANTINE">QC Quarantine</option>
+                  </select>
+                  <div class="control-actions">
+                    <button class="btn btn-primary btn-sm" type="button" id="inbound-input-new" data-action="quick-create" data-module="INBOUND">
+                      <i class="fa-solid fa-plus me-1"></i> Input Baru
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" type="button" id="inbound-sync">
+                      <i class="fa-solid fa-rotate me-1"></i> Sync
+                    </button>
+                  </div>
+                  <button class="btn btn-outline-secondary ms-auto" type="button" id="btn-inbound-refresh">
+                    <i class="fa-solid fa-rotate-right"></i>
+                  </button>
+                </div>
+                <div class="table-responsive">
+                  <table class="table app-table table-hover align-middle">
+                    <thead>
+                      <tr>
+                        <th style="width:16%;">No. SJ &amp; RcvID</th>
+                        <th style="width:20%;">Supplier</th>
+                        <th style="width:12%;">Lokasi</th>
+                        <th style="width:18%;">SKU &amp; Barang</th>
+                        <th class="text-end" style="width:12%;">Qty Baik / Cacat</th>
+                        <th style="width:14%;">Status QC &amp; Waktu</th>
+                        <th class="text-end" style="width:8%;">Aksi</th>
+                      </tr>
+                    </thead>
+                    <tbody id="inbound-body">
+                      <tr><td colspan="7" class="empty-state">Memuat data penerimaan...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="table-pager" id="inbound-pager"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="module-panel" id="inbound-quarantine-panel">
+            <div class="card app-card">
+              <div class="card-body">
+                <div class="toolbar">
+                  <div class="search-box">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input type="search" class="form-control" id="quarantine-search" placeholder="Cari QID, RCV, SKU...">
+                  </div>
+                  <select class="form-select toolbar-select" id="quarantine-status-filter">
+                    <option value="ALL">Semua Status</option>
+                    <option value="PENDING">Pending</option>
+                    <option value="RETURNED_TO_SUPPLIER">Dikembalikan</option>
+                    <option value="SCRAPPED">Afkir</option>
+                    <option value="WAITING_REPLACEMENT">Menunggu Penggantian</option>
+                    <option value="CLOSED">Selesai</option>
+                  </select>
+                  <div class="control-actions">
+                    <button class="btn btn-primary btn-sm" type="button" id="quarantine-input-new" data-action="quick-create" data-module="INBOUND">
+                      <i class="fa-solid fa-plus me-1"></i> Input Baru
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" type="button" id="quarantine-sync">
+                      <i class="fa-solid fa-rotate me-1"></i> Sync
+                    </button>
+                  </div>
+                  <button class="btn btn-outline-secondary ms-auto" type="button" id="btn-quarantine-refresh">
+                    <i class="fa-solid fa-rotate-right"></i>
+                  </button>
+                </div>
+                <div class="table-responsive">
+                  <table class="table app-table table-hover align-middle">
+                    <thead>
+                      <tr>
+                        <th style="width:16%;">QID</th>
+                        <th style="width:14%;">RcvID</th>
+                        <th style="width:14%;">SKU</th>
+                        <th class="text-end" style="width:10%;">Qty Cacat</th>
+                        <th style="width:24%;">Alasan</th>
+                        <th style="width:12%;">Disposisi</th>
+                        <th style="width:12%;">Status</th>
+                        <th class="text-end" style="width:8%;">Aksi</th>
+                      </tr>
+                    </thead>
+                    <tbody id="quarantine-body">
+                      <tr><td colspan="8" class="empty-state">Memuat data karantina...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="table-pager" id="quarantine-pager"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="module-panel" id="inbound-claims-panel">
+            <div class="card app-card">
+              <div class="card-body">
+                <div class="toolbar">
+                  <div class="search-box">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input type="search" class="form-control" id="claims-search" placeholder="Cari Claim ID, Order, SKU...">
+                  </div>
+                  <select class="form-select toolbar-select" id="claims-status-filter">
+                    <option value="ALL">Semua Status</option>
+                    <option value="OPEN">Open</option>
+                    <option value="RESOLVED">Resolved</option>
+                    <option value="CLOSED">Closed</option>
+                  </select>
+                  <div class="control-actions">
+                    <button class="btn btn-primary btn-sm" type="button" id="claims-input-new" data-action="quick-create" data-module="INBOUND">
+                      <i class="fa-solid fa-plus me-1"></i> Input Baru
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" type="button" id="claims-sync">
+                      <i class="fa-solid fa-rotate me-1"></i> Sync
+                    </button>
+                  </div>
+                  <button class="btn btn-outline-secondary ms-auto" type="button" id="btn-claims-refresh">
+                    <i class="fa-solid fa-rotate-right"></i>
+                  </button>
+                </div>
+                <div class="table-responsive">
+                  <table class="table app-table table-hover align-middle">
+                    <thead>
+                      <tr>
+                        <th style="width:14%;">Claim ID</th>
+                        <th style="width:14%;">Order ID</th>
+                        <th style="width:14%;">SKU</th>
+                        <th class="text-end" style="width:10%;">Qty Return</th>
+                        <th style="width:24%;">Alasan</th>
+                        <th style="width:14%;">Aksi Disposisi</th>
+                        <th style="width:12%;">Status Claim</th>
+                        <th class="text-end" style="width:8%;">Aksi</th>
+                      </tr>
+                    </thead>
+                    <tbody id="claims-body">
+                      <tr><td colspan="8" class="empty-state">Memuat data klaim retur...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="table-pager" id="claims-pager"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================== OUTBOUND & PENGIRIMAN ================== -->
+        <section id="view-outbound" class="app-view">
+          <div class="module-tabs">
+            <button class="module-tab active" type="button" data-outbound-tab="orders">
+              <i class="fa-solid fa-file-invoice"></i> Daftar Order PO
+            </button>
+            <button class="module-tab" type="button" data-outbound-tab="picking">
+              <i class="fa-solid fa-list-check"></i> Picking List
+            </button>
+            <button class="module-tab" type="button" data-outbound-tab="manifest">
+              <i class="fa-solid fa-truck"></i> Manifest Pengiriman
+            </button>
+          </div>
+
+          <div class="module-panel active" id="outbound-orders-panel">
+            <div class="card app-card">
+              <div class="card-body">
+                <div class="toolbar">
+                  <div class="search-box">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input type="search" class="form-control" id="outbound-search" placeholder="Cari No. PO, Order, Outlet...">
+                  </div>
+                  <select class="form-select toolbar-select" id="outbound-status-filter">
+                    <option value="ALL">Semua Status</option>
+                    <option value="CONFIRMED">Confirmed</option>
+                    <option value="PICKING">Picking</option>
+                    <option value="CHECKING">Checking</option>
+                    <option value="PACKED">Packed</option>
+                    <option value="DISPATCHED">Dispatched</option>
+                    <option value="COMPLETED">Completed</option>
+                    <option value="CANCELLED">Cancelled</option>
+                  </select>
+                  <div class="control-actions">
+                    <button class="btn btn-primary btn-sm" type="button" id="outbound-input-new" data-action="quick-create" data-module="OUTBOUND">
+                      <i class="fa-solid fa-plus me-1"></i> Input Baru
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" type="button" id="outbound-sync">
+                      <i class="fa-solid fa-rotate me-1"></i> Sync
+                    </button>
+                  </div>
+                  <button class="btn btn-outline-secondary ms-auto" type="button" id="btn-outbound-refresh">
+                    <i class="fa-solid fa-rotate-right"></i>
+                  </button>
+                </div>
+                <div class="table-responsive">
+                  <table class="table app-table table-hover align-middle">
+                    <thead>
+                      <tr>
+                        <th style="width:14%;">Order ID</th>
+                        <th style="width:20%;">No PO</th>
+                        <th style="width:22%;">Outlet</th>
+                        <th style="width:16%;">Tanggal Order</th>
+                        <th style="width:16%;">Status</th>
+                        <th class="text-end" style="width:12%;">Aksi</th>
+                      </tr>
+                    </thead>
+                    <tbody id="outbound-body">
+                      <tr><td colspan="6" class="empty-state">Memuat data order...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="table-pager" id="outbound-pager"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="module-panel" id="outbound-picking-panel">
+            <div class="card app-card">
+              <div class="card-body">
+                <div class="toolbar">
+                  <div class="search-box">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input type="search" class="form-control" id="picking-search" placeholder="Cari Order, SKU, Lokasi...">
+                  </div>
+                  <select class="form-select toolbar-select" id="picking-status-filter">
+                    <option value="ALL">Semua Status</option>
+                    <option value="PENDING">Pending</option>
+                    <option value="DONE">Selesai</option>
+                  </select>
+                  <div class="control-actions">
+                    <button class="btn btn-primary btn-sm" type="button" id="picking-input-new" data-action="quick-create" data-module="OUTBOUND">
+                      <i class="fa-solid fa-plus me-1"></i> Input Baru
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" type="button" id="picking-sync">
+                      <i class="fa-solid fa-rotate me-1"></i> Sync
+                    </button>
+                  </div>
+                  <button class="btn btn-outline-secondary ms-auto" type="button" id="btn-picking-refresh">
+                    <i class="fa-solid fa-rotate-right"></i>
+                  </button>
+                </div>
+                <div class="table-responsive">
+                  <table class="table app-table table-hover align-middle">
+                    <thead>
+                      <tr>
+                        <th style="width:14%;">Pick ID</th>
+                        <th style="width:16%;">Order ID</th>
+                        <th style="width:14%;">SKU</th>
+                        <th style="width:18%;">Lokasi</th>
+                        <th class="text-end" style="width:12%;">Qty To Pick</th>
+                        <th style="width:14%;">Status Pick</th>
+                        <th class="text-end" style="width:12%;">Aksi</th>
+                      </tr>
+                    </thead>
+                    <tbody id="picking-body">
+                      <tr><td colspan="7" class="empty-state">Memuat data picking...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="table-pager" id="picking-pager"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="module-panel" id="outbound-manifest-panel">
+            <div class="card app-card">
+              <div class="card-body">
+                <div class="toolbar">
+                  <div class="search-box">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input type="search" class="form-control" id="manifest-search" placeholder="Cari Manifest, Order, Ekspedisi...">
+                  </div>
+                  <select class="form-select toolbar-select" id="manifest-status-filter">
+                    <option value="ALL">Semua Status</option>
+                    <option value="SHIPPED">Dikirim</option>
+                    <option value="DELIVERED">Diterima</option>
+                  </select>
+                  <div class="control-actions">
+                    <button class="btn btn-primary btn-sm" type="button" id="manifest-input-new" data-action="quick-create" data-module="OUTBOUND">
+                      <i class="fa-solid fa-plus me-1"></i> Input Baru
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" type="button" id="manifest-sync">
+                      <i class="fa-solid fa-rotate me-1"></i> Sync
+                    </button>
+                  </div>
+                  <button class="btn btn-outline-secondary ms-auto" type="button" id="btn-manifest-refresh">
+                    <i class="fa-solid fa-rotate-right"></i>
+                  </button>
+                </div>
+                <div class="table-responsive">
+                  <table class="table app-table table-hover align-middle">
+                    <thead>
+                      <tr>
+                        <th style="width:16%;">Manifest ID</th>
+                        <th style="width:14%;">Order ID</th>
+                        <th style="width:18%;">Ekspedisi</th>
+                        <th style="width:18%;">No Resi / AWB</th>
+                        <th style="width:14%;">Driver</th>
+                        <th style="width:12%;">Status</th>
+                        <th class="text-end" style="width:8%;">Aksi</th>
+                      </tr>
+                    </thead>
+                    <tbody id="manifest-body">
+                      <tr><td colspan="7" class="empty-state">Memuat data manifest...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="table-pager" id="manifest-pager"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================== STOCK OPNAME ================== -->
+        <section id="view-opname" class="app-view">
+          <div class="card app-card">
+            <div class="card-body">
+              <div class="toolbar">
+                <div class="search-box">
+                  <i class="fa-solid fa-magnifying-glass"></i>
+                  <input type="search" class="form-control" id="opname-search" placeholder="Cari SO ID, SKU, lokasi...">
+                </div>
+                <select class="form-select toolbar-select" id="opname-status-filter">
+                  <option value="ALL">Semua Status</option>
+                  <option value="IN_PROGRESS">In Progress</option>
+                  <option value="COUNTED">Counted</option>
+                  <option value="APPROVED">Approved</option>
+                  <option value="CANCELLED">Cancelled</option>
+                </select>
+                <button class="btn btn-primary" type="button" id="btn-create-opname" data-permission="approval">
+                  <i class="fa-solid fa-plus"></i> Buat SO
+                </button>
+                <div class="control-actions">
+                  <button class="btn btn-primary btn-sm" type="button" id="opname-input-new" data-action="quick-create" data-module="STOCK_OPNAME">
+                    <i class="fa-solid fa-plus me-1"></i> Input Baru
+                  </button>
+                  <button class="btn btn-outline-secondary btn-sm" type="button" id="opname-sync">
+                    <i class="fa-solid fa-rotate me-1"></i> Sync
+                  </button>
+                </div>
+                <button class="btn btn-outline-secondary ms-auto" type="button" id="btn-opname-refresh">
+                  <i class="fa-solid fa-rotate-right"></i>
+                </button>
+              </div>
+              <div class="table-responsive">
+                <table class="table app-table table-hover align-middle">
+                  <thead>
+                    <tr>
+                      <th style="width:14%;">SO ID</th>
+                      <th style="width:14%;">Tanggal SO</th>
+                      <th style="width:22%;">Cakupan</th>
+                      <th class="text-end" style="width:10%;">Total SKU</th>
+                      <th class="text-end" style="width:10%;">Progress</th>
+                      <th class="text-end" style="width:12%;">Variance</th>
+                      <th style="width:12%;">Status</th>
+                      <th class="text-end" style="width:12%;">Aksi</th>
+                    </tr>
+                  </thead>
+                  <tbody id="opname-body">
+                    <tr><td colspan="8" class="empty-state">Memuat data stock opname...</td></tr>
+                  </tbody>
+                </table>
+                <div class="table-pager" id="opname-pager"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================== MASTER & SISTEM ================== -->
+        <section id="view-master" class="app-view">
+          <div class="module-tabs">
+            <button class="module-tab active" type="button" data-master-type="items">Barang</button>
+            <button class="module-tab" type="button" data-master-type="locations">Rak / Lokasi</button>
+            <button class="module-tab" type="button" data-master-type="suppliers">Supplier</button>
+            <button class="module-tab" type="button" data-master-type="outlets">Outlet</button>
+            <button class="module-tab" type="button" data-master-type="users">Users</button>
+            <button class="module-tab" type="button" data-master-type="sync">Sync Logs</button>
+          </div>
+
+          <div class="card app-card">
+            <div class="card-body">
+              <div class="toolbar">
+                <div class="search-box">
+                  <i class="fa-solid fa-magnifying-glass"></i>
+                  <input type="search" class="form-control" id="master-search" placeholder="Cari data master...">
+                </div>
+                <button class="btn btn-primary" type="button" id="btn-add-master">
+                  <i class="fa-solid fa-plus"></i> Tambah <span id="master-add-label">Barang</span>
+                </button>
+                <div class="control-actions">
+                  <button class="btn btn-primary btn-sm" type="button" id="master-input-new" data-action="quick-create" data-module="MASTER">
+                    <i class="fa-solid fa-plus me-1"></i> Input Baru
+                  </button>
+                  <button class="btn btn-outline-secondary btn-sm" type="button" id="master-sync">
+                    <i class="fa-solid fa-rotate me-1"></i> Sync
+                  </button>
+                </div>
+                <button class="btn btn-outline-secondary ms-auto" type="button" id="btn-master-refresh">
+                  <i class="fa-solid fa-rotate-right"></i>
+                </button>
+              </div>
+              <div class="table-responsive">
+                <table class="table app-table table-hover align-middle">
+                  <thead id="master-table-head"></thead>
+                  <tbody id="master-body">
+                    <tr><td colspan="8" class="empty-state">Memuat data master...</td></tr>
+                  </tbody>
+                </table>
+                <div class="table-pager" id="master-pager"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================== USERS & SYNC LOGS ================== -->
+        <section id="view-users" class="app-view">
+          <div class="card app-card mb-3">
+            <div class="card-body">
+              <div class="toolbar">
+                <div class="search-box">
+                  <i class="fa-solid fa-magnifying-glass"></i>
+                  <input type="search" class="form-control" id="users-search" placeholder="Cari user, role, status...">
+                </div>
+                <button class="btn btn-primary" type="button" id="btn-add-user">
+                  <i class="fa-solid fa-user-plus"></i> Tambah User
+                </button>
+                <div class="control-actions">
+                  <button class="btn btn-primary btn-sm" type="button" id="users-input-new" data-action="quick-create" data-module="USERS">
+                    <i class="fa-solid fa-plus me-1"></i> Input Baru
+                  </button>
+                  <button class="btn btn-outline-secondary btn-sm" type="button" id="users-sync">
+                    <i class="fa-solid fa-rotate me-1"></i> Sync
+                  </button>
+                </div>
+                <button class="btn btn-outline-secondary ms-auto" type="button" id="btn-users-refresh">
+                  <i class="fa-solid fa-rotate-right"></i>
+                </button>
+              </div>
+              <div class="table-responsive">
+                <table class="table app-table table-hover align-middle">
+                  <thead>
+                    <tr>
+                      <th>User</th>
+                      <th>Username</th>
+                      <th>Role</th>
+                      <th>Status</th>
+                      <th>User ID</th>
+                      <th class="text-end">Aksi</th>
+                    </tr>
+                  </thead>
+                  <tbody id="users-body">
+                    <tr><td colspan="6" class="empty-state">Memuat data user...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================== SINKRONISASI ================== -->
+        <section id="view-sync" class="app-view">
+          <div class="card app-card">
+            <div class="card-header app-card-header">
+              <div>
+                <h6><i class="fa-solid fa-rotate me-2"></i>Riwayat Sinkronisasi</h6>
+                <small>Rekonsiliasi INBOUND_RECEIVING dan OUTBOUND_ORDERS</small>
+              </div>
+              <button class="btn btn-outline-success btn-sm" type="button" id="btn-sync-now">
+                <i class="fa-solid fa-cloud-arrow-down"></i> Sync Sekarang
+              </button>
+            </div>
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="table app-table table-hover align-middle">
+                  <thead>
+                    <tr>
+                      <th>Waktu</th>
+                      <th>Trigger</th>
+                      <th class="text-end">Inbound</th>
+                      <th class="text-end">Outbound</th>
+                      <th class="text-end">Log Baru</th>
+                      <th class="text-end">SKU</th>
+                      <th>Status</th>
+                      <th class="text-end">Durasi</th>
+                      <th class="text-end">Aksi</th>
+                    </tr>
+                  </thead>
+                  <tbody id="sync-history-body">
+                    <tr><td colspan="9" class="empty-state">Memuat riwayat sinkronisasi...</td></tr>
+                  </tbody>
+                </table>
+                <div class="table-pager" id="sync-history-pager"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================== ADJUSTMENT & TRANSFER (Inline) ================== -->
+        <section id="view-adjustment" class="app-view d-none">
+          <div class="row g-3">
+            <div class="col-xl-6">
+              <div class="card app-card form-card h-100">
+                <div class="card-header app-card-header">
+                  <div>
+                    <h6><i class="fa-solid fa-sliders me-2"></i>Stock Adjustment</h6>
+                    <small>Koreksi saldo stok dengan alasan wajib</small>
+                  </div>
+                </div>
+                <div class="card-body">
+                  <form id="adjustment-inline-form">
+                    <div class="row g-2">
+                      <div class="col-md-7">
+                        <label class="form-label">SKU</label>
+                        <select class="form-select" name="sku" id="adjust-sku" required></select>
+                      </div>
+                      <div class="col-md-5">
+                        <label class="form-label">Lokasi / Rak</label>
+                        <select class="form-select" name="locationID" id="adjust-location" required></select>
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Qty Adjustment</label>
+                        <input type="number" class="form-control" name="qty" id="adjust-qty" placeholder="Contoh: 5 atau -3" required>
+                        <div class="form-text">Positif menambah, negatif mengurangi.</div>
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Referensi</label>
+                        <input type="text" class="form-control" name="refDoc" id="adjust-ref" placeholder="Opsional">
+                      </div>
+                      <div class="col-12">
+                        <label class="form-label">Alasan Adjustment</label>
+                        <textarea class="form-control" name="reason" id="adjust-reason" rows="2" required placeholder="Contoh: koreksi hasil hitung fisik"></textarea>
+                      </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary mt-3">
+                      <i class="fa-solid fa-floppy-disk"></i> Simpan Adjustment
+                    </button>
+                  </form>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-xl-6">
+              <div class="card app-card form-card h-100">
+                <div class="card-header app-card-header">
+                  <div>
+                    <h6><i class="fa-solid fa-right-left me-2"></i>Transfer Antar Bin</h6>
+                    <small>Pindahkan stok tanpa mengubah total saldo</small>
+                  </div>
+                </div>
+                <div class="card-body">
+                  <form id="transfer-inline-form">
+                    <div class="row g-2">
+                      <div class="col-12">
+                        <label class="form-label">SKU</label>
+                        <select class="form-select" name="sku" id="transfer-sku" required></select>
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Lokasi Asal</label>
+                        <select class="form-select" name="fromLocationID" id="transfer-from" required></select>
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Lokasi Tujuan</label>
+                        <select class="form-select" name="toLocationID" id="transfer-to" required></select>
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Qty Transfer</label>
+                        <input type="number" min="1" class="form-control" name="qty" id="transfer-qty" required>
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Referensi</label>
+                        <input type="text" class="form-control" name="refDoc" id="transfer-ref" placeholder="Opsional">
+                      </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary mt-3">
+                      <i class="fa-solid fa-right-left"></i> Proses Transfer
+                    </button>
+                  </form>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card app-card mt-3">
+            <div class="card-header app-card-header">
+              <div>
+                <h6><i class="fa-solid fa-clock-rotate-left me-2"></i>Riwayat Adjustment &amp; Transfer</h6>
+                <small>500 mutasi terakhir dari STOCK_LOGS</small>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="table app-table table-hover align-middle">
+                  <thead>
+                    <tr>
+                      <th>Waktu</th>
+                      <th>SKU</th>
+                      <th>Barang</th>
+                      <th>Tipe</th>
+                      <th class="text-end">Masuk</th>
+                      <th class="text-end">Keluar</th>
+                      <th class="text-end">Saldo</th>
+                      <th>Ref</th>
+                      <th>User</th>
+                    </tr>
+                  </thead>
+                  <tbody id="adjustment-logs-body">
+                    <tr><td colspan="9" class="empty-state">Memuat riwayat adjustment...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================== APPROVAL BASO ================== -->
+        <section id="view-approval" class="app-view d-none">
+          <div class="approval-banner">
+            <i class="fa-solid fa-triangle-exclamation"></i>
+            <div>
+              <strong><span id="approval-count">0</span> dokumen menunggu approval BASO</strong>
+              <span>Periksa variance hasil hitung fisik sebelum menyetujui penyesuaian stok.</span>
+            </div>
+          </div>
+
+          <div class="card app-card">
+            <div class="card-body">
+              <div class="toolbar">
+                <div class="search-box">
+                  <i class="fa-solid fa-magnifying-glass"></i>
+                  <input type="search" class="form-control" id="approval-search" placeholder="Cari SO ID, SKU, atau lokasi...">
+                </div>
+                <select class="form-select toolbar-select" id="approval-status-filter">
+                  <option value="ALL">Semua Pending</option>
+                  <option value="PENDING">Pending</option>
+                  <option value="COUNTED">Counted</option>
+                </select>
+                <button class="btn btn-outline-secondary ms-auto" type="button" id="btn-approval-refresh">
+                  <i class="fa-solid fa-rotate-right"></i>
+                </button>
+              </div>
+              <div class="table-responsive">
+                <table class="table app-table table-hover align-middle">
+                  <thead>
+                    <tr>
+                      <th>SO ID</th>
+                      <th>Tanggal</th>
+                      <th>Cakupan</th>
+                      <th class="text-end">Total SKU</th>
+                      <th class="text-end">Progress</th>
+                      <th class="text-end">Variance</th>
+                      <th>Status</th>
+                      <th class="text-end">Aksi</th>
+                    </tr>
+                  </thead>
+                  <tbody id="approval-body">
+                    <tr><td colspan="8" class="empty-state">Memuat dokumen approval...</td></tr>
+                  </tbody>
+                </table>
+                <div class="table-pager" id="approval-pager"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <div id="loading-overlay" class="loading-overlay d-none">
+        <div class="loading-card">
+          <div class="spinner-border text-success" role="status"></div>
+          <span id="loading-text">Memproses...</span>
+        </div>
+      </div>
+
+      <div id="toast-container" class="toast-container position-fixed bottom-0 end-0 p-3"></div>
+      <div id="modal-root"></div>
+    </div>
+
+    <!-- ====================================================================== -->
+    <!-- STANDALONE LOGIN SCRIPT (isolated, selalu tersedia meski main IIFE gagal) -->
+    <!-- ====================================================================== -->
+    <script>
+      // Fungsi login yang diekspos ke global scope secara terpisah dari main IIFE
+      // sehingga onclick="submitLogin()" di HTML selalu tersedia meski ada error
+      // di modul aplikasi utama.
+      window.submitLogin = function () {
+        var usernameEl = document.getElementById('login-username');
+        var passwordEl = document.getElementById('login-password');
+        var rememberEl = document.getElementById('login-remember');
+        var username = (usernameEl && usernameEl.value) ? usernameEl.value.trim() : '';
+        var password = (passwordEl && passwordEl.value) ? passwordEl.value : '';
+        var remember = !!(rememberEl && rememberEl.checked);
+
+        var errorBox = document.getElementById('login-error');
+        if (!username) {
+          if (errorBox) { errorBox.textContent = 'Username wajib diisi.'; errorBox.classList.add('is-visible'); }
+          if (usernameEl) usernameEl.focus();
+          return;
+        }
+        if (!password) {
+          if (errorBox) { errorBox.textContent = 'Password wajib diisi.'; errorBox.classList.add('is-visible'); }
+          if (passwordEl) passwordEl.focus();
+          return;
+        }
+        if (errorBox) { errorBox.textContent = ''; errorBox.classList.remove('is-visible'); }
+
+        var submitBtn = document.getElementById('login-submit');
+        var submitText = document.getElementById('login-submit-text');
+        if (submitBtn) { submitBtn.disabled = true; }
+        if (submitText) { submitText.textContent = 'Memproses...'; }
+
+        google.script.run
+          .withSuccessHandler(function (session) {
+            if (submitBtn) { submitBtn.disabled = false; }
+            if (submitText) { submitText.textContent = 'Masuk ke Dashboard'; }
+            if (!session) {
+              if (errorBox) { errorBox.textContent = 'Server mengembalikan respons kosong (null).'; errorBox.classList.add('is-visible'); }
+              return;
+            }
+            // Simpan token dan masuk ke aplikasi
+            try {
+              var token = session.token;
+              var rememberFlag = !!session.remember;
+              // Simpan ke storage
+              try {
+                if (rememberFlag) {
+                  localStorage.setItem('wms_token_remember', token);
+                  sessionStorage.removeItem('wms_token_session');
+                } else {
+                  sessionStorage.setItem('wms_token_session', token);
+                  localStorage.removeItem('wms_token_remember');
+                }
+              } catch (e) { /* storage may be blocked */ }
+              // Panggil enterApp dari main IIFE jika tersedia
+              if (typeof window.enterApp === 'function') {
+                window.enterApp(session);
+              } else {
+                // Fallback: refresh halaman agar sesi diambil
+                location.reload();
+              }
+            } catch (err) {
+              if (errorBox) { errorBox.textContent = 'Gagal memproses login: ' + (err && err.message ? err.message : String(err)); errorBox.classList.add('is-visible'); }
+              if (submitBtn) { submitBtn.disabled = false; }
+              if (submitText) { submitText.textContent = 'Masuk ke Dashboard'; }
+            }
+          })
+          .withFailureHandler(function (err) {
+            if (submitBtn) { submitBtn.disabled = false; }
+            if (submitText) { submitText.textContent = 'Masuk ke Dashboard'; }
+            if (errorBox) { errorBox.textContent = err && err.message ? err.message : 'Login gagal. Silakan coba lagi.'; errorBox.classList.add('is-visible'); }
+          })
+          .loginUser(username, password, remember);
+      };
+
+      // handleLogin juga diekspos untuk form onsubmit
+      window.handleLogin = function (event) {
+        event.preventDefault();
+        window.submitLogin();
+        return false;
+      };
+    </script>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js"></script>
+    <?!= include('Scripts') ?>
+  </body>
+</html>
